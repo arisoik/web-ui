@@ -127,14 +127,41 @@
           </DriveGridDrop>
         </DriveGrid>
 
-        <DriveTable
-          v-else
-          :files="sortedFiles"
-          :selectedFiles.sync="selectedFiles"
-          @sortBy="setSortBy"
-          @openMenu="openMenu"
-          @navigateDrive="navigateDrive"
-        />
+        <section v-else class="drive-list">
+          <div class="drive-list__head">
+            <span class="drive-list__check"></span>
+            <span class="drive-list__icon"></span>
+            <button type="button" class="drive-list__sort" @click="setSortBy('name')">{{ translate("DRIVE.NAME") }}</button>
+            <button type="button" class="drive-list__sort" @click="setSortBy('size')">{{ translate("DRIVE.SIZE") }}</button>
+            <button type="button" class="drive-list__sort" @click="setSortBy('type')">{{ translate("DRIVE.TYPE") }}</button>
+            <button type="button" class="drive-list__sort" @click="setSortBy('modified')">{{ translate("DRIVE.MODIFIED") }}</button>
+            <span class="drive-list__menu"></span>
+          </div>
+          <div
+            v-for="file in sortedFiles"
+            :key="file.getFileProperties().name"
+            class="drive-row"
+            :class="{ 'drive-row--selected': isSelected(file) }"
+          >
+            <label class="drive-row__check">
+              <input type="checkbox" :checked="isSelected(file)" @click.stop="toggleSelection(file, $event)"
+                  :aria-label="file.getFileProperties().name" />
+            </label>
+            <span class="drive-row__icon" :class="{ 'drive-row__icon--dir': file.isDirectory() }" aria-hidden="true">
+              <img v-if="getThumbnailURL(file)" :src="getThumbnailURL(file)" alt="" />
+              <svg v-else-if="file.isDirectory()" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+              <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>
+            </span>
+            <button type="button" class="drive-row__name" @click="navigateDrive(file)">
+              <span class="drive-row__label">{{ file.getFileProperties().name }}</span>
+              <span v-if="isShared(file)" class="pg-chip drive-row__shared">{{ translate("APPNAV.SHAREDWITH") }}</span>
+            </button>
+            <span class="drive-row__cell">{{ sizeLabel(file) }}</span>
+            <span class="drive-row__cell">{{ file.getFileProperties().getType() }}</span>
+            <span class="drive-row__cell">{{ modifiedLabel(file) }}</span>
+            <button type="button" class="drive-row__menu" aria-label="menu" @click.stop="openMenu(file)"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="12" cy="19" r="1.7"/></svg></button>
+          </div>
+        </section>
       </transition>
     </div>
 
@@ -564,6 +591,7 @@ module.exports = {
             confirm_consumer_cancel_func: () => {},
             confirm_consumer_func: () => {},
 			showSpinner: true,
+			launcherStarted: false,
 			spinnerMessage: '',
 			onUpdateCompletion: [], // methods to invoke when current dir is next refreshed
             dblClickDelay: 700,
@@ -581,7 +609,7 @@ module.exports = {
             disallowedFilenames: new Map(),
 		};
 	},
-	mixins:[downloaderMixins, router, zipMixin, launcherMixin, i18n, sandboxMixin],
+	mixins:[downloaderMixins, helpers, router, zipMixin, launcherMixin, i18n, sandboxMixin],
         mounted: function() {
                         let grid = localStorage.getItem("isGrid");
                         if (grid != null)
@@ -906,10 +934,7 @@ module.exports = {
 		illegalFilenames.forEach(item => that.disallowedFilenames.set(item, ""));
 		// TODO: throttle onResize and make it global?
 		window.addEventListener('resize', this.onResize, {passive: true} );
-        peergos.shared.user.App.init(that.context, "launcher").thenApply(launcher => {
-            that.launcherApp = launcher;
-            that.init();
-        });
+        this.startWhenReady();
 	},
 
 	beforeDestroy() {
@@ -921,6 +946,9 @@ module.exports = {
 	watch: {
 		// manually encode currentDir dependencies to get around infinite dependency chain issues with async-computed methods
 		context(newContext, oldContext) {
+			// a fresh login creates this view before the store has a context, and App.init
+			// never resolves without one: the spinner then stays until the view is recreated
+			this.startWhenReady();
 			this.updateCurrentDir();
 			if (newContext != null && newContext.username != null) {
 				this.updateUsage();
@@ -977,6 +1005,38 @@ module.exports = {
             'updateMirrorBatId'
 		]),
 
+		/** Runs once, as soon as there is a context to run against. */
+		/** A folder counts its children; a file states its size. */
+		sizeLabel(file) {
+			if (file.isWrapper)
+				return "";
+			if (file.isDirectory())
+				return file.directChildrenCount + " items";
+			return this.convertBytesToHumanReadable('' + this.getFileSize(file.getFileProperties()));
+		},
+		/** A recent edit reads better as an age than as a date. */
+		modifiedLabel(file) {
+			let modified = file.getFileProperties().modified;
+			if (modified == null)
+				return "";
+			let when = new Date(modified.toString());
+			if (isNaN(when.getTime()))
+				return "" + modified;
+			let days = Math.floor((Date.now() - when.getTime()) / 86400000);
+			if (days < 1)
+				return when.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+			return when.toLocaleDateString([], { day: 'numeric', month: 'short', year: 'numeric' });
+		},
+		startWhenReady() {
+			if (this.launcherStarted || this.context == null)
+				return;
+			this.launcherStarted = true;
+			let that = this;
+			peergos.shared.user.App.init(this.context, "launcher").thenApply(launcher => {
+				that.launcherApp = launcher;
+				that.init();
+			});
+		},
 		init() {
 		    this.isStreamingAvailable = this.supportsStreaming();
 		    let that = this;
@@ -3657,6 +3717,159 @@ module.exports = {
 </script>
 
 <style>
+/* File list: the same card, chip and tone language as the sync and mount views,
+   laid out on one grid so every row lines up with the header above it. */
+.drive-list {
+    --drive-cols: 34px 44px minmax(0, 1fr) 110px 140px 150px 44px;
+    margin: 0 0 24px;
+    border: 1px solid var(--border-color);
+    border-radius: 14px;
+    background-color: var(--pg-surface, transparent);
+    overflow: hidden;
+}
+
+.drive-list__head,
+.drive-row {
+    display: grid;
+    grid-template-columns: var(--drive-cols);
+    align-items: center;
+    gap: 12px;
+    padding: 0 14px;
+}
+
+.drive-list__head {
+    height: 44px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.drive-list__sort {
+    padding: 0;
+    font-size: 11px;
+    font-weight: var(--bold);
+    letter-spacing: .07em;
+    text-transform: uppercase;
+    text-align: left;
+    color: var(--pg-muted);
+    background: none;
+    border: 0;
+    cursor: pointer;
+}
+
+.drive-list__sort:hover {
+    color: inherit;
+}
+
+.drive-row {
+    min-height: 56px;
+    border-top: 1px solid var(--border-color);
+}
+
+.drive-row:first-of-type {
+    border-top: 0;
+}
+
+/* selection is a state of this list, not a verdict on the file: keep it neutral so the
+   tinted rows stay available for things that have actually gone right or wrong */
+.drive-row--selected {
+    background-color: var(--pg-surface-2);
+}
+
+.drive-row__icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    border-radius: 9px;
+    color: var(--pg-muted);
+    background-color: var(--pg-surface-2);
+    overflow: hidden;
+}
+
+/* a folder is the one row type worth colouring: it is where a click leads somewhere */
+.drive-row__icon--dir {
+    color: var(--pg-link);
+}
+
+.drive-row__icon svg {
+    width: 19px;
+    height: 19px;
+}
+
+.drive-row__icon img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+.drive-row__name {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    padding: 0;
+    font: inherit;
+    font-weight: var(--bold);
+    text-align: left;
+    color: inherit;
+    background: none;
+    border: 0;
+    cursor: pointer;
+}
+
+.drive-row__label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.drive-row__shared {
+    flex: none;
+}
+
+.drive-row__cell {
+    font-size: var(--text-small);
+    color: var(--pg-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.drive-row__menu {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    color: var(--pg-muted);
+    background: none;
+    border: 0;
+    border-radius: 8px;
+    cursor: pointer;
+}
+
+.drive-row__menu:hover {
+    background-color: var(--pg-surface-2);
+}
+
+.drive-row__menu svg {
+    width: 18px;
+    height: 18px;
+}
+
+/* the columns that only repeat what the name already implies go first on a phone */
+@media (max-width: 700px) {
+    .drive-list {
+        --drive-cols: 34px 44px minmax(0, 1fr) 44px;
+    }
+
+    .drive-list__sort:nth-of-type(n + 2),
+    .drive-row__cell {
+        display: none;
+    }
+}
+
 .drive-view {
   min-height: 100vh;
   display: flex;
