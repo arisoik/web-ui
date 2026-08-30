@@ -18,7 +18,7 @@
 
 				<!-- Aggregate state: the single thing you came to find out -->
 
-		<section class="pg-summary" :class="'pg-tone--' + tone">
+		<section v-if="loadedPairs" class="pg-summary" :class="'pg-tone--' + tone">
 					<span class="pg-summary__icon" aria-hidden="true">
 						<svg v-if="tone === 'ok'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
 						<svg v-else-if="tone === 'busy'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/></svg>
@@ -57,8 +57,11 @@
 					<span>{{ globalError }}</span>
 				</p>
 
+				<!-- until the folders have been fetched, an empty list is not a first run -->
+				<Spinner v-if="! loadedPairs"></Spinner>
+
 				<!-- First run -->
-				<section v-if="syncPairs.length === 0" class="pg-empty">
+				<section v-else-if="syncPairs.length === 0" class="pg-empty">
 					<span class="pg-empty__mark" aria-hidden="true">
 						<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4 3 8l4 4"/><path d="M3 8h13"/><path d="m17 20 4-4-4-4"/><path d="M21 16H8"/></svg>
 					</span>
@@ -283,6 +286,7 @@ module.exports = {
 	data() {
 		return {
 			syncPairs: [],
+			loadedPairs: false,
 			showSimpleFolderPicker: false,
 			drivesSimplePicker: [],
 			multipleFolderSelectionSimplePicker: false,
@@ -576,6 +580,7 @@ module.exports = {
 		getSyncState() {
 			let that = this;
 			this.localPost("/peergos/v0/sync/get-pairs").then(function(result, err) {
+				that.loadedPairs = true;
 				if (result == null || result.pairs == null)
 					return;
 				// keep the live status already merged onto the previous objects
@@ -594,6 +599,9 @@ module.exports = {
 					merged.push(p);
 				}
 				that.syncPairs = merged;
+			}).catch(function() {
+				// nothing to list is still an answer: leaving the view loading forever is worse
+				that.loadedPairs = true;
 			})
 		},
 

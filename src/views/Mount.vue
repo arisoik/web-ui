@@ -25,7 +25,7 @@
 
 			<template v-else>
 				<!-- The state you came to find out, and the action that changes it -->
-				<section class="pg-summary" :class="'pg-tone--' + (isMounted ? 'ok' : 'pending')">
+				<section v-if="loadedConfig" class="pg-summary" :class="'pg-tone--' + (isMounted ? 'ok' : 'pending')">
 					<span class="pg-summary__icon" aria-hidden="true">
 						<svg v-if="isMounted" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
 						<svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>
@@ -47,8 +47,11 @@
 					</div>
 				</section>
 
+				<!-- until the config has been fetched, not mounted is not the same as no mount -->
+				<Spinner v-if="! loadedConfig"></Spinner>
+
 				<!-- Mounted: the same endpoint pair the sync page uses -->
-				<template v-if="isMounted">
+				<template v-else-if="isMounted">
 					<ul class="pg-cards">
 						<li class="pg-card">
 							<div class="pg-card__head">
@@ -299,6 +302,9 @@ module.exports = {
             // the can* flags come from the server, which knows what this platform's backend does
             config: { enabled: false, mountPoint: "", mountDrive: false, syncCalendar: false, syncContacts: false,
                     canSyncCalendar: false, canSyncContacts: false, davClients: false },
+            // the config above is the default, not an answer: until the server replies the
+            // view knows nothing, and an unmounted drive is not the same as no mount
+            loadedConfig: false,
             form: { peergosPassword: "", autoMount: true, mountDrive: true, syncCalendar: false, syncContacts: false },
             showSpinner: false,
             progressToastId: null,
@@ -396,6 +402,7 @@ module.exports = {
         getConfig() {
             let that = this;
             this.localPost("/peergos/v0/mount/get-config").then(function(result) {
+                that.loadedConfig = true;
                 that.config = result;
                 // the server reports a failed restore here and nowhere else, so a
                 // dropped error leaves the page claiming a mount that is not there
@@ -409,6 +416,8 @@ module.exports = {
                     that.pollForMount();
                 }
             }).catch(function(err) {
+                // an answer either way: leaving the view loading forever is worse
+                that.loadedConfig = true;
                 that.error = that.problem(err);
             });
         },
