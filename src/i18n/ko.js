@@ -461,6 +461,7 @@ module.exports = {
     "CALENDAR.INVALID.NAME":"유효하지 않은 캘린더 이름. 영숫자, 공백, 대시, 밑줄만 사용하세요",
     "CALENDAR.ALREADY.IMPORTED":"캘린더: $NAME이(가) 이미 가져와졌습니다",
     "CALENDAR.ERROR.SAVE":"Unable to save calendar",
+    "CALENDAR.SHARED.CHANGED":"Someone else changed this entry, so it was reloaded rather than overwritten",
     "CALENDAR.ERROR.SAVE.TASK":"Unable to save task",
     "CALENDAR.ERROR.DELETE.TASK":"Unable to delete task",
     "CALENDAR.NAME.EXISTS":"A calendar called $NAME already exists",

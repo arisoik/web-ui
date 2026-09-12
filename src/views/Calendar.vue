@@ -92,6 +92,9 @@ module.exports = {
             CALENDAR_DIR_NAME: 'calendar',
             DATA_DIR_NAME: 'data',
             CALENDAR_FILE_EXTENSION: '.ics',
+            // Entries someone else owns, kept as a snapshot of their file beside a pointer
+            // back to it. Flat like tasks/, and read in full on every load.
+            SHARED_DIR_NAME: 'shared',
             CONFIG_FILENAME: 'App.config',
             NEW_CALENDAR_FILENAME: 'calendar.inf',
             // A sweep walks every stored month so the app can search and
@@ -135,6 +138,13 @@ module.exports = {
             choice_options: [],
             isIframeInitialised: false,
             importFile: null,
+            // The one file a secret link to an entry grants, kept so a writable one can be
+            // written back through the capability it arrived with.
+            linkedFile: null,
+            // The path the opened entry came from and how old it was, which is what a
+            // snapshot of someone else's entry points back at.
+            openedFilePath: null,
+            openedFileStamp: null,
             importCalendarPath: null,
             owner: null,
             loadCalendarAsGuest: false,
@@ -270,16 +280,18 @@ module.exports = {
                     return;
                 }
                 let file = fileOpt.get();
+                that.linkedFile = file;
                 let props = file.getFileProperties();
-                file.getInputStream(that.context.network, that.context.crypto, props.sizeHigh(), props.sizeLow(), function(read) {})
-                .thenCompose(function(reader) {
-                    var size = that.getFileSize(props);
-                    var data = convertToByteArray(new Int8Array(size));
-                    return reader.readIntoArray(data, 0, data.length)
-                    .thenApply(function(read){
-                        future.complete({importFile: new TextDecoder().decode(data), importCalendarPath: null,
-                            owner: file.getOwnerName(), hasEmail: hasEmail});
-                    });
+                that.openedFilePath = path + (path.endsWith("/") ? "" : '/') + filename;
+                that.openedFileStamp = that.sharedStamp(props);
+                that.readFileText(file).thenApply(function(text) {
+                    future.complete({importFile: text, importCalendarPath: null,
+                        owner: file.getOwnerName(), hasEmail: hasEmail, isWritable: file.isWritable()});
+                    return null;
+                }).exceptionally(function(throwable) {
+                    that.$toast.error(that.translate('CALENDAR.ERROR.LOAD.FILE'), {timeout:false});
+                    future.complete(null);
+                    return null;
                 });
             });
       }
@@ -347,6 +359,21 @@ module.exports = {
         let handlers = Object.assign(Object.create(null), {
             pong: function() { that.isIframeInitialised = true; },
             save: function(data) { that.saveEvent(calendar, data); },
+            saveLinked: function(data) { that.saveLinkedEntry(data); },
+            // In the same lane as everything else addressed to one entry: a second save
+            // starting before the first had written the snapshot would read the old one
+            // and refuse itself as somebody else's change.
+            saveShared: function(data) {
+                that.queueForEntry(that.sharedLane(data), function(done) {
+                    that.saveSharedEntry(calendar, data, done);
+                });
+            },
+            deleteShared: function(data) {
+                that.queueForEntry(that.sharedLane(data), function(done) {
+                    that.deleteSharedEntry(calendar, data);
+                    done();
+                });
+            },
             saveAll: function(data) { that.saveAllEvents(calendar, data); },
             delete: function(data) { that.deleteEvent(calendar, data); },
             deleteCalendar: function(data) { that.deleteCalendar(calendar, data); },
@@ -608,10 +635,31 @@ module.exports = {
         if (that.loadCalendarAsGuest) {
             that.postMessage({type: 'importICSFile', contents: that.importFile,
                 isSharedWithUs: that.owner != that.context.username, loadCalendarAsGuest: that.loadCalendarAsGuest,
-                username: that.context.username, confirmImport: that.confirmImport });
+                username: that.context.username, confirmImport: that.confirmImport,
+                writable: !that.isCalendarReadOnly && that.linkedFile != null });
+        } else if (that.owner != null && that.owner != that.context.username) {
+            // Someone else's entry. Kept as a snapshot of their file beside a pointer to
+            // it, so their later changes can reach it - a copy in a month of our own never
+            // hears from them again. Where that cannot be done it is imported as before.
+            let asBefore = function() {
+                that.loadCalendars(calendar, year, month, {contents: that.importFile,
+                    isSharedWithUs: true, loadCalendarAsGuest: false,
+                    username: that.context.username});
+            };
+            that.snapshotSharedEntry(calendar).thenApply(function(kept) {
+                if (kept) {
+                    that.loadCalendars(calendar, year, month);
+                } else {
+                    asBefore();
+                }
+                return null;
+            }).exceptionally(function(throwable) {
+                asBefore();
+                return null;
+            });
         } else {
             let importCalendarEventParams = {contents: that.importFile,
-                isSharedWithUs: that.owner != that.context.username,
+                isSharedWithUs: false,
                 loadCalendarAsGuest: that.loadCalendarAsGuest,
                 username: that.context.username };
             this.loadCalendars(calendar, year, month, importCalendarEventParams);
@@ -905,8 +953,9 @@ module.exports = {
         Vue.nextTick(function() {
             // Posted before the reads start, so no bucket can arrive at the
             // app ahead of the shell that clears the state it belongs to.
-            // One message per month, plus the recurring folder and the tasks.
-            that.postLoadShell(year, month, months.length + 2, importCalendarEventParams);
+            // One message per month, plus the recurring folder, the tasks, and the entries
+            // other people have shared with us.
+            that.postLoadShell(year, month, months.length + 3, importCalendarEventParams);
             months.forEach(function(each) {
                 that.getCalendarEventsForMonth(calendar, each.year, each.month).thenApply(function(events) {
                     if (token === that.loadToken)
@@ -922,6 +971,22 @@ module.exports = {
             that.getTaskItems(calendar).thenApply(function(taskItems) {
                 if (token === that.loadToken)
                     that.postMessage({type: 'loadTasks', tasks: taskItems, loadBucket: true});
+            });
+            // Drawn from the snapshot alone, with nothing of the owner's read on the way to
+            // the first paint: an entry someone shared has to be there whether or not their
+            // data can be reached right now. Catching up with them happens after.
+            that.getSharedEntries(calendar).thenApply(function(sharedEntries) {
+                if (token !== that.loadToken)
+                    return null;
+                that.postMessage({type: 'loadShared', shared: sharedEntries, loadBucket: true});
+                // Moves first: an entry whose owner rescheduled it across a month sits at a
+                // path this snapshot does not know yet, and reconciling before looking there
+                // would find nothing and mark it detached for no reason.
+                that.repointMovedShares(calendar, token, sharedEntries).thenApply(function(updated) {
+                    that.reconcileShared(calendar, token, updated);
+                    return null;
+                });
+                return null;
             });
         });
     },
@@ -1027,6 +1092,10 @@ module.exports = {
     taskDirPath: function(calendarName) {
         let calendarDirectory = this.findCalendarDirectory(calendarName);
         return calendarDirectory == null ? null : calendarDirectory + "/tasks";
+    },
+    sharedDirPath: function(calendarName) {
+        let calendarDirectory = this.findCalendarDirectory(calendarName);
+        return calendarDirectory == null ? null : calendarDirectory + "/" + this.SHARED_DIR_NAME;
     },
     itemDirPath: function(item) {
         return item.isTask ? this.taskDirPath(item.calendarName)
@@ -1377,6 +1446,29 @@ module.exports = {
         }).exceptionally(failed);
         return future;
     },
+    // A writable link is a capability on one file and nothing else: the entry goes back
+    // to the file it arrived in, in place. There is no directory here to move it to, which
+    // is why the frame refuses an edit that would change the month it belongs to.
+    saveLinkedEntry: function(data) {
+        let that = this;
+        if (! this.isSecretLink || this.isCalendarReadOnly || this.linkedFile == null
+            || ! this.isString(data.item)) {
+            return;
+        }
+        this.displaySpinner();
+        this.overwriteWithText(this.linkedFile, data.item)
+            .thenApply(function(updated) {
+                // The write hands back the file as it now is, and the next one has to start
+                // from that rather than from the version the link was opened with.
+                that.linkedFile = updated;
+                that.removeSpinner();
+                return null;
+            }).exceptionally(function(throwable) {
+                that.removeSpinner();
+                that.showMessage(true, that.translate('CALENDAR.ERROR.SAVE.EVENT'));
+                return null;
+            });
+    },
     saveEvent: function(calendar, item) {
 	    const that = this;
 	    that.displaySpinner();
@@ -1399,6 +1491,9 @@ module.exports = {
 	        }
 	        write.thenApply(function(res) {
 	            done();
+	            if (item.movedFrom != null) {
+	                that.carryShareAcross(item);
+	            }
 	        }).exceptionally(function(throwable) {
 	            done();
 	            that.showMessage(true, that.translate(failed));
@@ -1691,6 +1786,468 @@ module.exports = {
     // on screen, and an undated one has no month to be found under.
     getTaskItems: function(calendar) {
         return this.readFromEachCalendar(calendar, c => c.directory + "/tasks");
+    },
+
+    // --- entries someone else owns ----------------------------------------------------
+    // Kept as a snapshot of the owner's file with a pointer back to it, written into the
+    // entry as X- properties the rest of the iCalendar world ignores. The snapshot is what
+    // draws - offline, revoked or not - and the pointer is what brings it up to date.
+    sharedPointerOf: function(icsText) {
+        if (! this.isString(icsText)) {
+            return null;
+        }
+        // Unfolded first: a long path arrives split across lines with a leading space.
+        let text = icsText.replace(/\r?\n[ \t]/g, '');
+        let read = function(name) {
+            let found = text.match(new RegExp('^X-PEERGOS-SRC-' + name + ':(.*)$', 'm'));
+            return found == null ? null : found[1].trim();
+        };
+        let owner = read('OWNER'), dir = read('DIR'), uid = read('UID'), path = read('PATH') || '';
+        // Every segment that reaches a path is checked the way the save and delete paths
+        // check theirs: a pointer is content, and content is never trusted with a path.
+        if (owner == null || dir == null || uid == null || ! this.isSafeEventId(uid)
+            || ! this.isSafeEventId(dir) || ! this.isSafeEventId(owner)
+            || ! this.isSafePointerPath(path)) {
+            return null;
+        }
+        return {owner: owner, dir: dir, uid: uid, path: path,
+            modified: read('MODIFIED') || '', detached: read('DETACHED') === 'true'};
+    },
+    // <owner>/.apps/calendar/data/<dir>/<2026/9 | recurring>/<uid>.ics, which is where the
+    // owner's own app keeps it.
+    sharedPointerFromPath: function(fullPath, stamp) {
+        let parts = this.isString(fullPath) ? fullPath.split('/').filter(p => p.length > 0) : [];
+        if (parts.length < 6 || parts[1] !== this.APPS_DIR_NAME
+            || parts[2] !== this.CALENDAR_DIR_NAME || parts[3] !== this.DATA_DIR_NAME) {
+            return null;
+        }
+        let name = parts[parts.length - 1];
+        if (name.length <= this.CALENDAR_FILE_EXTENSION.length
+            || ! name.endsWith(this.CALENDAR_FILE_EXTENSION)) {
+            return null;
+        }
+        let pointer = {owner: parts[0], dir: parts[4],
+            uid: name.substring(0, name.length - this.CALENDAR_FILE_EXTENSION.length),
+            path: parts.slice(5, parts.length - 1).join('/'), modified: stamp || '', detached: false};
+        return this.isSafeEventId(pointer.uid) && this.isSafeEventId(pointer.dir)
+            && this.isSafeEventId(pointer.owner) && this.isSafePointerPath(pointer.path)
+            ? pointer : null;
+    },
+    // The middle of a source path: the months an entry can sit under, or `recurring`.
+    isSafePointerPath: function(path) {
+        if (! this.isString(path)) {
+            return false;
+        }
+        if (path.length === 0) {
+            return true;
+        }
+        return path.split('/').every(segment => this.isSafeEventId(segment));
+    },
+    sharedSourcePath: function(pointer) {
+        let parts = [pointer.owner, this.APPS_DIR_NAME, this.CALENDAR_DIR_NAME,
+            this.DATA_DIR_NAME, pointer.dir];
+        if (pointer.path.length > 0) {
+            parts = parts.concat(pointer.path.split('/').filter(p => p.length > 0));
+        }
+        return parts.join('/') + '/' + pointer.uid + this.CALENDAR_FILE_EXTENSION;
+    },
+    // Named for the owner as well as the entry: two people can share entries carrying the
+    // same UID, and one of them would otherwise land on top of the other.
+    sharedSnapshotName: function(pointer) {
+        return pointer.owner + '-' + pointer.uid + this.CALENDAR_FILE_EXTENSION;
+    },
+    // Whatever the platform's date type prints, as long as it changes when the file does.
+    sharedStamp: function(props) {
+        return props == null || props.modified == null ? '' : String(props.modified);
+    },
+    // A snapshot's pointer is ours, not the owner's: it never goes back into their file.
+    stripSharedPointer: function(icsText) {
+        return this.isString(icsText) ? icsText.replace(/^X-PEERGOS-SRC-[A-Z]+:.*\r?\n/gm, '') : '';
+    },
+    buildSharedSnapshot: function(pointer, icsText) {
+        let lines = ['X-PEERGOS-SRC-OWNER:' + pointer.owner,
+            'X-PEERGOS-SRC-DIR:' + pointer.dir,
+            'X-PEERGOS-SRC-UID:' + pointer.uid,
+            'X-PEERGOS-SRC-PATH:' + pointer.path,
+            'X-PEERGOS-SRC-MODIFIED:' + pointer.modified];
+        if (pointer.detached) {
+            lines.push('X-PEERGOS-SRC-DETACHED:true');
+        }
+        // Any pointer the source already carried is dropped first, so snapshotting a
+        // snapshot - or the same entry twice - cannot stack them up.
+        let body = this.stripSharedPointer(icsText);
+        return body.replace(/(BEGIN:VEVENT\r?\n)/, '$1' + lines.join('\r\n') + '\r\n');
+    },
+    // The calendar of the user's own that a snapshot belongs in: their first writable one,
+    // the same choice the app makes for anything else that has to land somewhere.
+    ownCalendarName: function() {
+        let all = this.calendarProperties == null ? [] : this.calendarProperties.calendars;
+        for (var i = 0; i < all.length; i++) {
+            let entry = all[i];
+            if ((entry.owner == null || entry.owner == this.context.username) && entry.writable !== false) {
+                return entry.name;
+            }
+        }
+        return null;
+    },
+    writeSharedSnapshot: function(calendarName, pointer, icsText) {
+        let dirPath = this.sharedDirPath(calendarName);
+        if (dirPath == null) {
+            return peergos.shared.util.Futures.of(false);
+        }
+        let bytes = convertToByteArray(new TextEncoder().encode(this.buildSharedSnapshot(pointer, icsText)));
+        return this.writeCalendarFile(null, dirPath, this.sharedSnapshotName(pointer), bytes);
+    },
+    // One write of a file's whole contents, for the two places that reach a file directly
+    // rather than through the calendar's own tree: a writable link, and an entry shared
+    // with us.
+    overwriteWithText: function(file, text) {
+        let bytes = convertToByteArray(new TextEncoder().encode(text));
+        let sizeHi = (bytes.length - (bytes.length % Math.pow(2, 32))) / Math.pow(2, 32);
+        return file.overwriteFileJS(peergos.shared.user.fs.AsyncReader.build(bytes), sizeHi,
+            bytes.length, this.context.network, this.context.crypto, len => {});
+    },
+    // Takes the snapshot from what is in the owner's file now, and tells the frame. Used
+    // wherever the two have been found to differ, whichever of them moved.
+    refreshSnapshotFrom: function(calendarName, pointer, file, writable) {
+        let that = this;
+        let stamp = this.sharedStamp(file.getFileProperties());
+        return this.readFileText(file).thenApply(function(text) {
+            let updated = Object.assign({}, pointer, {modified: stamp, detached: false});
+            that.writeSharedSnapshot(calendarName, updated, text).thenApply(function(written) {
+                that.postSharedState(calendarName, updated, writable, false,
+                    that.buildSharedSnapshot(updated, text));
+                return null;
+            });
+            return true;
+        });
+    },
+    readFileText: function(file) {
+        let that = this;
+        let future = peergos.shared.util.Futures.incomplete();
+        let props = file.getFileProperties();
+        file.getInputStream(this.context.network, this.context.crypto, props.sizeHigh(), props.sizeLow(), function(read) {})
+            .thenCompose(function(reader) {
+                let size = that.getFileSize(props);
+                let data = convertToByteArray(new Int8Array(size));
+                return reader.readIntoArray(data, 0, data.length).thenApply(function(read) {
+                    future.complete(new TextDecoder().decode(data));
+                    return null;
+                });
+            }).exceptionally(function(throwable) {
+                future.completeExceptionally(throwable);
+                return null;
+            });
+        return future;
+    },
+    // The entry the user just opened belongs to someone else: it is kept beside a pointer
+    // to their file rather than copied into a month of the user's own, where it would stop
+    // matching what they have the moment they changed it.
+    snapshotSharedEntry: function(calendar) {
+        let that = this;
+        let pointer = this.sharedPointerFromPath(this.openedFilePath, this.openedFileStamp);
+        let calendarName = this.ownCalendarName();
+        // Refused rather than attempted: a file outside the owner's calendar tree, a session
+        // with no calendar of its own to keep it in, or a file holding no event - a shared
+        // task is drawn from the task list, not from here. The caller then imports it the
+        // way it always did, so nothing that used to open stops opening.
+        if (pointer == null || calendarName == null || pointer.owner == this.context.username
+            || ! /BEGIN:VEVENT/.test(String(this.importFile))) {
+            return peergos.shared.util.Futures.of(false);
+        }
+        return this.writeSharedSnapshot(calendarName, pointer, this.importFile)
+            .exceptionally(function(throwable) {
+                that.showMessage(true, that.translate('CALENDAR.ERROR.SAVE.EVENT'));
+                return false;
+            });
+    },
+    // Follows every snapshot's pointer and brings it up to date, after the first paint
+    // rather than on the way to it. Three outcomes: unchanged, changed - rewrite and
+    // redraw - and unreachable, which keeps the snapshot and says so.
+    reconcileShared: function(calendar, token, entries) {
+        let that = this;
+        (entries || []).forEach(function(entry) {
+            let pointer = that.sharedPointerOf(entry.data);
+            if (pointer == null) {
+                return;
+            }
+            that.context.getByPath(that.sharedSourcePath(pointer)).thenApply(function(fileOpt) {
+                if (token !== that.loadToken) {
+                    return null;
+                }
+                if (fileOpt == null || ! fileOpt.isPresent()) {
+                    // Offline, revoked and deleted look the same through a capability on one
+                    // file, so the snapshot stays and is marked rather than taken away on
+                    // what may be nothing worse than a bad connection.
+                    that.detachShared(entry, pointer);
+                    return null;
+                }
+                let file = fileOpt.get();
+                let stamp = that.sharedStamp(file.getFileProperties());
+                let writable = file.isWritable();
+                if (stamp === pointer.modified && ! pointer.detached) {
+                    that.postSharedState(entry.calendarName, pointer, writable, false, null);
+                    return null;
+                }
+                that.refreshSnapshotFrom(entry.calendarName, pointer, file, writable)
+                    .exceptionally(function(throwable) {
+                        that.detachShared(entry, pointer);
+                        return null;
+                    });
+                return null;
+            }).exceptionally(function(throwable) {
+                that.detachShared(entry, pointer);
+                return null;
+            });
+        });
+    },
+    detachShared: function(entry, pointer) {
+        if (pointer.detached) {
+            this.postSharedState(entry.calendarName, pointer, false, true, null);
+            return;
+        }
+        let updated = Object.assign({}, pointer, {detached: true});
+        this.writeSharedSnapshot(entry.calendarName, updated, entry.data);
+        this.postSharedState(entry.calendarName, updated, false, true, null);
+    },
+    // RFC 5545's revision count, bumped on every write-through so other clients can see
+    // that a revision happened. It is not what decides a conflict here: an app that never
+    // writes one - the owner's own, until now - would leave it standing still while the
+    // file changed underneath.
+    icsSequenceOf: function(icsText) {
+        let found = this.isString(icsText)
+            ? icsText.replace(/\r?\n[ \t]/g, '').match(/^SEQUENCE:(\d+)\s*$/m) : null;
+        return found == null ? 0 : parseInt(found[1], 10);
+    },
+    withIcsSequence: function(icsText, sequence) {
+        let line = 'SEQUENCE:' + sequence;
+        return /^SEQUENCE:\d+\s*$/m.test(icsText)
+            ? icsText.replace(/^SEQUENCE:\d+\s*$/m, line)
+            : icsText.replace(/(BEGIN:VEVENT\r?\n)/, '$1' + line + '\r\n');
+    },
+    // A shared entry is saved where it lives: the owner's file. Only then is the snapshot
+    // rewritten, and from what actually landed there rather than from what was sent - the
+    // two saying different things is the failure this whole arrangement exists to avoid.
+    sharedLane: function(data) {
+        return 'shared:' + data.owner + ':' + data.uid;
+    },
+    saveSharedEntry: function(calendar, data, finished) {
+        let that = this;
+        let done = function(ok) {
+            if (! ok) {
+                that.showMessage(true, that.translate('CALENDAR.ERROR.SAVE.EVENT'));
+            }
+            finished();
+        };
+        if (! this.isString(data.item) || this.findCalendarDirectory(data.calendarName) == null) {
+            done(false);
+            return;
+        }
+        this.displaySpinner();
+        this.readSharedSnapshot(calendar, data).thenApply(function(found) {
+            if (found == null) {
+                done(false);
+                return null;
+            }
+            let pointer = found.pointer;
+            that.context.getByPath(that.sharedSourcePath(pointer)).thenApply(function(fileOpt) {
+                if (fileOpt == null || ! fileOpt.isPresent() || ! fileOpt.get().isWritable()) {
+                    // Revoked, moved or simply out of reach: the snapshot says so instead of
+                    // the save looking as though it landed.
+                    that.detachShared({calendarName: data.calendarName, data: found.text}, pointer);
+                    done(false);
+                    return null;
+                }
+                let file = fileOpt.get();
+                // Last-writer-wins underneath, so a save that would land on top of a change
+                // nobody here has seen is refused and the snapshot brought up to date. A
+                // moment remains between this look and the write: without a compare-and-set
+                // in the filesystem there is no closing it.
+                let stamp = that.sharedStamp(file.getFileProperties());
+                if (stamp !== pointer.modified) {
+                    that.refreshSnapshotFrom(data.calendarName, pointer, file, true)
+                        .thenApply(function(refreshed) {
+                            that.showMessage(true, that.translate('CALENDAR.SHARED.CHANGED'));
+                            finished();
+                            return null;
+                        }).exceptionally(function(throwable) { done(false); return null; });
+                    return null;
+                }
+                let outgoing = that.withIcsSequence(that.stripSharedPointer(data.item),
+                    that.icsSequenceOf(found.text) + 1);
+                that.overwriteWithText(file, outgoing)
+                    .thenApply(function(updatedFile) {
+                        let written = that.sharedStamp(updatedFile.getFileProperties());
+                        let updated = Object.assign({}, pointer, {modified: written, detached: false});
+                        let text = outgoing;
+                        that.writeSharedSnapshot(data.calendarName, updated, text).thenApply(function(ok) {
+                            that.postSharedState(data.calendarName, updated, true, false,
+                                that.buildSharedSnapshot(updated, text));
+                            done(true);
+                            return null;
+                        }).exceptionally(function(throwable) { done(false); return null; });
+                        return null;
+                    }).exceptionally(function(throwable) { done(false); return null; });
+                return null;
+            }).exceptionally(function(throwable) { done(false); return null; });
+            return null;
+        }).exceptionally(function(throwable) { done(false); return null; });
+    },
+    // An entry that moved takes its share with it. Where it sits encodes its date, so a
+    // reschedule across a month or a year is a different file, and whoever it was shared
+    // with would be left pointing at one that is about to be deleted. The new file is
+    // granted before the old one goes, never after.
+    carryShareAcross: function(item) {
+        let that = this;
+        let from = item.movedFrom;
+        let owner = this.findCalendarOwner(item.calendarName);
+        // Only ours to grant.
+        if (from == null || (owner != null && owner !== this.context.username)) {
+            return;
+        }
+        let oldDir = this.eventDirPath(item.calendarName, from.year, from.month, from.isRecurring);
+        let newDir = this.eventDirPath(item.calendarName, item.year, item.month, item.isRecurring);
+        if (oldDir == null || newDir == null || oldDir === newDir) {
+            return;
+        }
+        let base = this.context.username + "/" + this.APPS_DIR_NAME + "/" + this.CALENDAR_DIR_NAME
+            + "/" + this.DATA_DIR_NAME + "/";
+        let filename = item.Id + this.CALENDAR_FILE_EXTENSION;
+        let newPath = peergos.client.PathUtils.toPath((base + newDir).split('/'), filename);
+        this.context.getDirectorySharingState(
+            peergos.client.PathUtils.directoryToPath((base + oldDir).split('/'))).thenApply(function(state) {
+                let shared = state.get(filename);
+                if (shared == null) {
+                    return null;
+                }
+                let readers = shared.readAccess, writers = shared.writeAccess;
+                let anyone = function(set) { return set != null && set.toArray([]).length > 0; };
+                // Each grant on its own: failing to carry one over is no reason to drop
+                // the other.
+                let grantWriters = function() {
+                    if (anyone(writers)) {
+                        that.context.shareWriteAccessWith(newPath, writers)
+                            .exceptionally(function(throwable) { return null; });
+                    }
+                };
+                if (anyone(readers)) {
+                    that.context.shareReadAccessWith(newPath, readers)
+                        .thenApply(function(done) { grantWriters(); return null; })
+                        .exceptionally(function(throwable) { grantWriters(); return null; });
+                } else {
+                    grantWriters();
+                }
+                return null;
+            }).exceptionally(function(throwable) { return null; });
+    },
+    // Where an entry has moved, the owner's re-share of its new path arrives as a feed
+    // entry. Read from a cursor of the calendar's own: the unread badge belongs to the
+    // newsfeed, and a scan here must never mark the user's social feed as read.
+    repointMovedShares: function(calendar, token, entries) {
+        let that = this;
+        let future = peergos.shared.util.Futures.incomplete();
+        let held = [];
+        (entries || []).forEach(function(entry) {
+            let pointer = that.sharedPointerOf(entry.data);
+            if (pointer != null) {
+                held.push({entry: entry, pointer: pointer});
+            }
+        });
+        if (held.length === 0 || this.calendarProperties == null) {
+            future.complete(entries);
+            return future;
+        }
+        this.context.getSocialFeed().thenApply(function(feed) {
+            let size = feed.getFeedSize();
+            let seen = that.calendarProperties.feedIndex;
+            let from = (typeof seen === 'number' && seen >= 0 && seen <= size) ? seen : 0;
+            if (from >= size) {
+                future.complete(entries);
+                return null;
+            }
+            feed.getShared(from, size, that.context.crypto, that.context.network).thenApply(function(items) {
+                items.toArray([]).forEach(function(item) {
+                    let moved = that.sharedPointerFromPath(String(item.path), '');
+                    if (moved == null) {
+                        return;
+                    }
+                    held.forEach(function(each) {
+                        let pointer = each.pointer;
+                        // Owner, calendar and entry all have to match, and only where it
+                        // sits may differ. A UID is whatever an .ics says it is, so matching
+                        // on that alone would let one person's share repoint another's
+                        // snapshot at a file of their own.
+                        if (moved.owner !== pointer.owner || moved.dir !== pointer.dir
+                            || moved.uid !== pointer.uid || moved.path === pointer.path) {
+                            return;
+                        }
+                        let updated = Object.assign({}, pointer, {path: moved.path, detached: false});
+                        each.entry.data = that.buildSharedSnapshot(updated, each.entry.data);
+                        each.pointer = updated;
+                        that.writeSharedSnapshot(each.entry.calendarName, updated, each.entry.data);
+                    });
+                });
+                that.rememberFeedIndex(calendar, size);
+                future.complete(entries);
+                return null;
+            }).exceptionally(function(throwable) {
+                future.complete(entries);
+                return null;
+            });
+            return null;
+        }).exceptionally(function(throwable) {
+            future.complete(entries);
+            return null;
+        });
+        return future;
+    },
+    rememberFeedIndex: function(calendar, index) {
+        if (this.calendarProperties == null || this.calendarProperties.feedIndex === index) {
+            return;
+        }
+        this.calendarProperties.feedIndex = index;
+        this.updatePropertiesFile(calendar, this.calendarProperties);
+    },
+    // Only ever our own snapshot. The entry belongs to whoever shared it.
+    deleteSharedEntry: function(calendar, data) {
+        let dirPath = this.sharedDirPath(data.calendarName);
+        let pointer = {owner: data.owner, uid: data.uid};
+        if (dirPath == null || ! this.isSafeEventId(data.uid) || ! this.isSafeEventId(data.owner)) {
+            return;
+        }
+        let filePath = peergos.client.PathUtils.toPath(dirPath.split('/'), this.sharedSnapshotName(pointer));
+        calendar.deleteInternal(filePath, this.context.username);
+    },
+    readSharedSnapshot: function(calendar, data) {
+        let that = this;
+        let future = peergos.shared.util.Futures.incomplete();
+        let dirPath = this.sharedDirPath(data.calendarName);
+        if (dirPath == null || ! this.isSafeEventId(data.uid) || ! this.isSafeEventId(data.owner)) {
+            future.complete(null);
+            return future;
+        }
+        let filePath = peergos.client.PathUtils.toPath(dirPath.split('/'),
+            this.sharedSnapshotName({owner: data.owner, uid: data.uid}));
+        calendar.readInternal(filePath, this.context.username).thenApply(function(bytes) {
+            let text = new TextDecoder().decode(bytes);
+            let pointer = that.sharedPointerOf(text);
+            future.complete(pointer == null ? null : {pointer: pointer, text: text});
+            return null;
+        }).exceptionally(function(throwable) {
+            future.complete(null);
+            return null;
+        });
+        return future;
+    },
+    postSharedState: function(calendarName, pointer, writable, detached, data) {
+        this.postMessage({type: 'sharedReconciled', calendarName: calendarName,
+            owner: pointer.owner, uid: pointer.uid, writable: writable === true,
+            detached: detached === true, data: data});
+    },
+
+    getSharedEntries: function(calendar) {
+        let that = this;
+        return this.readFromEachCalendar(calendar, c => c.directory + "/" + that.SHARED_DIR_NAME);
     },
 
     updateCalendarList: function(calendar) {

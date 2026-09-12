@@ -457,6 +457,7 @@ module.exports = {
     "CALENDAR.INVALID.NAME":"Nome calendario non valido. Utilizza solo caratteri alfanumerici più spazio, trattino e trattino basso",
     "CALENDAR.ALREADY.IMPORTED":"Calendario: $NAME già importato",
     "CALENDAR.ERROR.SAVE":"Unable to save calendar",
+    "CALENDAR.SHARED.CHANGED":"Someone else changed this entry, so it was reloaded rather than overwritten",
     "CALENDAR.ERROR.SAVE.TASK":"Unable to save task",
     "CALENDAR.ERROR.DELETE.TASK":"Unable to delete task",
     "CALENDAR.NAME.EXISTS":"A calendar called $NAME already exists",

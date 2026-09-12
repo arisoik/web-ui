@@ -46,6 +46,15 @@ public class Suite {
             run(failures, "calendar files read by another parser", () -> CalendarInteropTest.run(args1));
             run(failures, "calendar drag to move", () -> CalendarDragTest.run(args1));
             run(failures, "calendar shared read-only", () -> CalendarReadOnlyTest.run(args1));
+            run(failures, "calendar writable link", () -> CalendarLinkWriteTest.run(args1));
+            // Two accounts, a friendship and four sign-ins: minutes rather than seconds, and
+            // the slow runners already spend most of their hour on the rest of this. WebKit
+            // is left out for a different reason - it cannot be relied on here to bring the
+            // calendar up for an account opening it for the first time, which is the driver
+            // rather than the app, and the same reason downloads skip it. Every other engine
+            // runs it, which is where most of the matrix is.
+            if (canPlaceDownloads && ! "1".equals(System.getenv("PEERGOS_TEST_SLOW")))
+                run(failures, "calendar entries shared between accounts", () -> CalendarLiveShareTest.run(args1));
             run(failures, "calendar store safety", () -> CalendarStoreTest.run(args1));
             if (canPlaceDownloads) {
                 run(failures, "download calendar event", () -> CalendarEventDownloadTest.run(args1));

@@ -313,6 +313,10 @@ let hostWindow = null;
 let hostOrigin = null;
 let hostUsername = null;
 let isGuestSession = false;
+// A secret link can carry write access. It is a capability on one file and nothing
+// else - there are no calendars behind it - so this is the only say in whether
+// anything in a guest session can be written.
+let linkWritable = false;
 
 // Whether the account has the Peergos Email app, told to us in `ping`. With
 // it, emailing an event attaches the real .ics; without it the best we can
@@ -1213,6 +1217,13 @@ function icsPropertyName(line) {
 
 function hasIcsProperty(lines, name) {
     return !!lines && lines.some(function (line) { return icsPropertyName(line) === name; });
+}
+
+function icsPropertyValue(lines, name) {
+    let found = (lines || []).find(function (line) { return icsPropertyName(line) === name; });
+    if (found == null) return null;
+    let colon = found.indexOf(':');
+    return colon === -1 ? '' : found.substring(colon + 1).trim();
 }
 
 // True for an alarm this app would itself have written: one it can show, and so
@@ -2314,7 +2325,7 @@ function truncateMasterSeries(master) {
 // --- Drag to move ---------------------------------------------------------
 function dragAllowed(ev, newStart) {
     if (!ev || ev.extendedProps.isTask) return false;
-    if (isGuestSession || !isCalendarWritable(ev.extendedProps.calendarId)) return false;
+    if (isGuestSession || !isEntryWritable(ev)) return false;
     if (ev.extendedProps.recur && ev.start && toDateInputValue(ev.start) !== toDateInputValue(newStart)) return false;
     return true;
 }
@@ -2441,7 +2452,10 @@ function showEventPopover(ev, anchorEl) {
     popoverDescriptionRow.style.display = description ? '' : 'none';
     if (description) popoverDescription.textContent = description;
 
-    let writable = isCalendarWritable(ev.extendedProps.calendarId);
+    let writable = isEntryWritable(ev);
+    // Only our own is ours to pass on: the host refuses anything else, and a button that
+    // always refuses is worse than no button.
+    popoverShareButton.style.display = (isGuestSession || isSharedEntry(ev)) ? 'none' : '';
     popoverActions.style.display = writable ? '' : 'none';
     // See .event-popover.has-actions in calendar.css
     popover.classList.toggle('has-actions', writable);
@@ -2894,6 +2908,10 @@ function defaultCalendarId() {
 }
 
 function isCalendarWritable(calendarId) {
+    if (isGuestSession) return linkWritable;
+    // Nothing to write into. A session with calendars can still hold an entry that names
+    // none, and the dialog used to test for that itself.
+    if (calendarId == null) return false;
     let cal = getCalendarById(calendarId);
     return !cal || !cal.readOnly;
 }
@@ -3485,7 +3503,7 @@ function openModal(mode, opts) {
 
     let targetCalendarId = mode === 'edit' ? opts.event.extendedProps.calendarId
         : ((opts.prefill && opts.prefill.calendarId) || defaultCalendarId());
-    let writable = targetCalendarId != null && isCalendarWritable(targetCalendarId);
+    let writable = mode === 'edit' ? isEntryWritable(opts.event) : isCalendarWritable(targetCalendarId);
     isReadOnlyForm = !writable;
     editableFields.forEach(el => el.disabled = !writable);
     saveButton.style.display = writable ? '' : 'none';
@@ -3644,7 +3662,7 @@ popoverCloseButton.addEventListener('click', hideEventPopover);
 // Shared by the popover's Edit button and double-clicking an event
 // directly - both should go through the same recurring-scope prompt.
 function openEditFor(ev) {
-    if (isCalendarWritable(ev.extendedProps.calendarId) && ev.extendedProps.recur) {
+    if (isEntryWritable(ev) && ev.extendedProps.recur) {
         openScopeModal(ev, 'edit');
     } else {
         openModal('edit', { event: ev, scope: 'all' });
@@ -4183,6 +4201,15 @@ form.addEventListener('submit', function (e) {
     // so saving an event another client wrote does not strip it (patchIcsBlock).
     if (editingEvent && editingEvent.extendedProps.sourceLines)
         extra.sourceLines = editingEvent.extendedProps.sourceLines;
+    // The dialog rebuilds the entry from the form, and what it does not carry over is lost.
+    // Where a shared entry came from is not the form's to know, and without it the save
+    // would go to a month of our own rather than back to the owner's file.
+    if (editingEvent && editingEvent.extendedProps.sharedOwner) {
+        extra.sharedOwner = editingEvent.extendedProps.sharedOwner;
+        extra.sharedUid = editingEvent.extendedProps.sharedUid;
+        extra.sharedWritable = editingEvent.extendedProps.sharedWritable;
+        extra.sharedDetached = editingEvent.extendedProps.sharedDetached;
+    }
     let recur = readRecurFromForm();
     if (recur && editingEvent) carryRecurSource(editingEvent.extendedProps.recur, recur);
 
@@ -5006,16 +5033,33 @@ function migrateOverridesOf(id) {
 }
 
 function persistEvent(ev) {
-    if (!ev || isGuestSession || !isCalendarWritable(ev.extendedProps.calendarId)) return;
+    if (!ev || !isEntryWritable(ev)) return;
+    if (isGuestSession) {
+        persistLinkedEvent(ev);
+        return;
+    }
+    if (isSharedEntry(ev)) {
+        // Written where it lives, which is the owner's own file. The host takes the
+        // snapshot from what actually landed there rather than from what was sent.
+        if (refusedAsAMove(ev)) return;
+        hostSend({ type: 'saveShared', owner: ev.extendedProps.sharedOwner,
+            uid: ev.extendedProps.sharedUid, calendarName: ev.extendedProps.calendarId,
+            item: buildIcsDocument(eventToIcsLines(ev)) });
+        return;
+    }
     scheduleReminders();
     migrateOverridesOf(ev.id);
     let placement = placementOf(ev);
     let previous = eventPlacements[ev.id];
-    // Moved file: drop the stale copy first, otherwise it reloads later as
-    // a duplicate. Paths always differ here (that's what "moved" means), so
-    // this can't race with the write below.
-    if (previous && !samePlacement(previous, placement)) persistDelete(ev.id, previous);
-    hostSend(Object.assign({ type: 'save' }, eventSavePayload(ev, placement)));
+    let moved = !!previous && !samePlacement(previous, placement);
+    // The new file first and the stale one after. Paths always differ here (that is what
+    // "moved" means), so the order is free of races either way - but an entry that was
+    // shared has to exist at its new place before the old one goes, or whoever it was
+    // shared with is left holding nothing in between. The host does that on `movedFrom`.
+    let payload = eventSavePayload(ev, placement);
+    if (moved) payload.movedFrom = previous;
+    hostSend(Object.assign({ type: 'save' }, payload));
+    if (moved) persistDelete(ev.id, previous);
     eventPlacements[ev.id] = placement;
 }
 
@@ -5027,7 +5071,36 @@ function addAndPersist(payload) {
     return ev;
 }
 
+// An entry reached through a capability on one file - a link, or something shared with us -
+// lives where its owner keeps it, and where that is encodes its date. Nothing here can move
+// it there, so an edit that would is refused rather than leaving them an entry their own
+// calendar looks for in the wrong month. Which calendar it is filed under is not compared:
+// that is ours to decide, and the form hands back a name where a link has none at all.
+function refusedAsAMove(ev) {
+    let arrived = eventPlacements[ev.id];
+    let now = placementOf(ev);
+    if (!arrived || (arrived.year === now.year && arrived.month === now.month
+            && arrived.isRecurring === now.isRecurring)) {
+        return false;
+    }
+    showToast('This entry can be changed, but not moved to another month');
+    return true;
+}
+
+function persistLinkedEvent(ev) {
+    if (refusedAsAMove(ev)) return;
+    hostSend({ type: 'saveLinked', item: buildIcsDocument(eventToIcsLines(ev)) });
+}
+
 function removeAndPersist(ev) {
+    if (isSharedEntry(ev)) {
+        // Only ever our own snapshot: the entry belongs to whoever shared it, and this is
+        // us saying we no longer want to follow it.
+        hostSend({ type: 'deleteShared', owner: ev.extendedProps.sharedOwner,
+            uid: ev.extendedProps.sharedUid, calendarName: ev.extendedProps.calendarId });
+        ev.remove();
+        return;
+    }
     let placement = eventPlacements[ev.id] || placementOf(ev);
     ev.remove();
     if (!migrateOverridesOf(ev.id)) persistDelete(ev.id, placement);
@@ -5069,6 +5142,12 @@ function applyReadOnlyMode() {
     // write is skipped, and the summary still claims they were imported.
     overflowImportButton.style.display = canCreate ? '' : 'none';
     addCalendarButton.style.display = isGuestSession ? 'none' : '';
+    // A link is one file, with no calendar to delete into or copy into. Editing is the one
+    // thing a writable one can do; passing it on is decided per entry when the popover
+    // opens, because an entry someone shared with us is not ours to pass on either.
+    let linkOnly = isGuestSession ? 'none' : '';
+    popoverDeleteButton.style.display = linkOnly;
+    popoverDuplicateButton.style.display = linkOnly;
 }
 
 function applyHostCalendars(hostCalendars) {
@@ -5209,6 +5288,90 @@ function handleHostLoadAdditional(data) {
     // clearing here would lift a spinner raised by a save or a share.
 }
 
+// --- entries someone else owns ------------------------------------------------------
+// The host keeps a snapshot of the owner's file beside a pointer back to it. This draws
+// the snapshot: it is on the grid whether the owner's data can be reached or not, and the
+// host says afterwards whether it is up to date, writable, or out of reach.
+//
+// The id carries the owner as well as the entry's own UID. Two people can share entries
+// carrying the same one, and an older import of our own can be holding it already.
+let SHARED_ID_PREFIX = 'shared:';
+
+function sharedIdFor(owner, uid) {
+    return SHARED_ID_PREFIX + owner + ':' + uid;
+}
+
+function sharedPointerFromLines(lines) {
+    let read = function (name) { return icsPropertyValue(lines, 'X-PEERGOS-SRC-' + name); };
+    let owner = read('OWNER'), uid = read('UID');
+    if (!owner || !uid) return null;
+    return {owner: owner, uid: uid, detached: read('DETACHED') === 'true'};
+}
+
+function addSharedEntries(entries) {
+    forEachParsedEntry(entries, function (parsed, entry) {
+        parsed.events.forEach(function (payload) {
+            let extra = payload.extendedProps || {};
+            let pointer = sharedPointerFromLines(extra.sourceLines);
+            if (pointer == null) return;
+            let id = sharedIdFor(pointer.owner, pointer.uid);
+            let already = calendar.getEventById(id);
+            if (already) already.remove();
+            payload.id = id;
+            payload.editable = false;
+            payload.extendedProps = Object.assign({}, extra, {
+                calendarId: entry.calendarName,
+                sharedOwner: pointer.owner,
+                sharedUid: pointer.uid,
+                // Until the host has reached the owner's file, a shared entry is something
+                // to read. It says so itself rather than borrowing the answer from the
+                // calendar it is filed under, which is one of ours and writable.
+                sharedWritable: false,
+                sharedDetached: pointer.detached
+            });
+            let added = calendar.addEvent(payload);
+            // Where it arrived, so an edit that would move it can be told apart from one
+            // that would not. Nothing else uses a shared entry's placement: its file is the
+            // owner's, and this app never writes it.
+            if (added) eventPlacements[id] = placementOf(added);
+        });
+    });
+}
+
+function handleHostLoadShared(data) {
+    addSharedEntries(data.shared);
+    applyCalendarVisibility();
+    noteLoadBucket(data);
+}
+
+// One snapshot, after the host has followed its pointer: brought up to date, found
+// writable, or out of reach. A snapshot is never taken away here - offline and revoked
+// look the same from a capability on one file.
+function handleSharedReconciled(data) {
+    if (data.data) {
+        addSharedEntries([{calendarName: data.calendarName, data: data.data}]);
+    }
+    let ev = calendar.getEventById(sharedIdFor(data.owner, data.uid));
+    if (!ev) return;
+    ev.setExtendedProp('sharedWritable', data.writable === true);
+    ev.setExtendedProp('sharedDetached', data.detached === true);
+    applyCalendarVisibility();
+}
+
+function isSharedEntry(ev) {
+    return !!(ev && ev.extendedProps && ev.extendedProps.sharedOwner);
+}
+
+// What decides whether an entry can be changed: a shared one answers for itself, anything
+// else takes the answer from the calendar it is in.
+function isEntryWritable(ev) {
+    if (!ev) return false;
+    if (isSharedEntry(ev)) {
+        return ev.extendedProps.sharedWritable === true && ev.extendedProps.sharedDetached !== true;
+    }
+    return isCalendarWritable(ev.extendedProps.calendarId);
+}
+
 function handleHostLoadTasks(data) {
     addHostTasksFrom(data.tasks);
     syncAllTaskEvents();
@@ -5250,6 +5413,8 @@ let hostHandlers = Object.assign(Object.create(null), {
     load: handleHostLoad,
     loadAdditional: handleHostLoadAdditional,
     loadTasks: handleHostLoadTasks,
+    loadShared: handleHostLoadShared,
+    sharedReconciled: handleSharedReconciled,
     sweepBatch: handleSweepBatch,
     sweepDone: handleSweepDone,
     // A secret link to a single .ics arrives this way and never sends a
@@ -5258,6 +5423,7 @@ let hostHandlers = Object.assign(Object.create(null), {
     importICSFile: function (data) {
         if (data.loadCalendarAsGuest) {
             isGuestSession = true;
+            linkWritable = !!data.writable;
             applyReadOnlyMode();
         }
         let added = importIcsText(data.contents);
