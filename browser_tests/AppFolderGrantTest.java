@@ -381,8 +381,43 @@ public class AppFolderGrantTest {
         Page.gotoView(d, "Launcher", "launchApp", "__launcher");
         d.script("window.__launcher.launchApp(arguments[0]);", APP);
         d.waitForScript("the app frame", "!!document.querySelector('" + OUTER + "')", 60_000);
-        d.waitUntil("the app to load", () -> Boolean.TRUE.equals(inAppQuiet(d,
-                "return !!document.getElementById('ready') && typeof window.run === 'function'")), 120_000);
+        String[] first = {null};
+        int[] looks = {0};
+        try {
+            d.waitUntil("the app to load", () -> {
+                looks[0]++;
+                try {
+                    return Boolean.TRUE.equals(inApp(d, "return !!document.getElementById('ready') && typeof window.run === 'function'"));
+                } catch (RuntimeException e) {
+                    if (first[0] == null)
+                        first[0] = "look " + looks[0] + ": " + e.getMessage();
+                    return false;
+                }
+            }, 120_000);
+            System.out.println("DIAG app loaded after " + looks[0] + " looks; first failed look: " + first[0]);
+        } catch (RuntimeException e) {
+            System.out.println("DIAG app did not load after " + looks[0] + " looks; first failed look: " + first[0] + "; " + frameState(d));
+            throw e;
+        }
+    }
+
+    static String frameState(WebDriver d) {
+        StringBuilder s = new StringBuilder();
+        try {
+            d.switchToTop();
+            s.append("top: ").append(d.scriptQuiet("return [...document.querySelectorAll('iframe')].map(f => f.id + '=' + f.src).join(', ')"));
+            d.switchToFrame(OUTER);
+            s.append("; sandbox: ").append(d.scriptQuiet("return location.href + ' ' + document.readyState + ' inner=' + !!document.querySelector('" + INNER + "')"
+                    + " + ' ' + (document.body ? document.body.innerText.replace(/\\s+/g, ' ').slice(0, 200) : 'no body')"));
+            d.switchToFrame(INNER);
+            s.append("; app: ").append(d.scriptQuiet("return location.href + ' ' + document.readyState + ' run=' + typeof window.run"
+                    + " + ' ' + (document.body ? document.body.innerText.replace(/\\s+/g, ' ').slice(0, 200) : 'no body')"));
+        } catch (RuntimeException e) {
+            s.append(" (stopped: ").append(e.getMessage()).append(")");
+        } finally {
+            d.switchToTop();
+        }
+        return s.toString();
     }
 
     static void closeApp(WebDriver d) {
