@@ -89,7 +89,7 @@
             </Gallery>
             <Confirm
                     v-if="showConfirm"
-                    v-on:hide-confirm="showConfirm = false"
+                    v-on:hide-confirm="confirmHidden"
                     :confirm_message='confirm_message'
                     :confirm_body="confirm_body"
                     :consumer_cancel_func="confirm_consumer_cancel_func"
@@ -171,6 +171,7 @@ const mixins = require("../../mixins/mixins.js");
 const downloaderMixins = require("../../mixins/downloader/index.js");
 const router = require("../../mixins/router/index.js");
 const sandboxMixin = require("../../mixins/sandbox/index.js");
+const callbacks = require("../../mixins/callbacks/index.js");
 const sandboxResponses = require("../../mixins/sandbox/responses.js");
 const launcherMixin = require("../../mixins/launcher/index.js");
 const contactsMixin = require("../../mixins/contacts/index.js");
@@ -300,6 +301,7 @@ module.exports = {
             EMAIL_FILE_EXTENSION: '.cbor',
             messageToTimestamp: new Map(),
             showConfirm: false,
+            confirm_on_hide: null,
             confirm_message: "",
             confirm_body: "",
             confirm_consumer_cancel_func: () => {},
@@ -1364,7 +1366,7 @@ module.exports = {
                     }
                     let file = fileOpt.get();
                     if (file.isDirectory()) {
-                        that.readFolderListing(false, headerFunc("text/plain"), file);
+                        that.readFolderListing(false, headerFunc("text/plain"), file, params.get('details') == 'true');
                     } else if (params.get('preview') == 'true') {
                         let fileType = file.getFileProperties().getType();
                         if (fileType == 'image' || fileType == 'video') {
@@ -1379,9 +1381,9 @@ module.exports = {
                 return;
             }
             let bytes = convertToByteArray(new Int8Array(data));
-            let location = relPath => {
+            let location = (relPath, inGrant) => {
                 let encoder = new TextEncoder();
-                return encoder.encode(that.apiRequest + '/folder/' + grantId + '/' + relPath);
+                return encoder.encode(that.apiRequest + '/folder/' + (inGrant || grantId) + '/' + relPath);
             };
             let write = (relPath, isNew) => that.sandboxedApp.writeGranted(grantId, relPath, bytes).thenApply(done => {
                 that.noteGrantInUse(grantId);
@@ -1408,6 +1410,31 @@ module.exports = {
                     that.sandboxedApp.mkdirGranted(grantId, relativePath)
                         .thenApply(done => that.buildResponse(headerFunc(), location(relativePath), that.CREATE_SUCCESS))
                         .exceptionally(failed);
+                } else if (apiMethod == 'POST' && (params.get('action') == 'rename' || params.get('action') == 'move')) {
+                    // The new name, or the destination as <grant id>/<folder in that grant>, is the body: a query
+                    // value is decoded twice on its way here, which breaks a name with a % in it. Answered as a
+                    // WebDAV MOVE is: 201, with where the entry is now.
+                    let arg = new TextDecoder().decode(new Uint8Array(data));
+                    let parts = relativePath.split('/').filter(p => p.length > 0);
+                    if (params.get('action') == 'rename') {
+                        that.sandboxedApp.renameGranted(grantId, relativePath, arg)
+                            .thenApply(done => that.buildResponse(headerFunc(), location(parts.slice(0, -1).concat([arg]).join('/')), that.CREATE_SUCCESS))
+                            .exceptionally(failed);
+                    } else {
+                        let target = that.splitGrantPath(arg);
+                        let folder = target.relativePath.split('/').filter(p => p.length > 0);
+                        that.sandboxedApp.getGrantInfo(target.grantId).thenCompose(targetInfo => {
+                            if (!targetInfo.write) {
+                                that.showError("App attempted to move into a folder it may only read");
+                                that.buildResponse(headerFunc(), null, that.FORBIDDEN);
+                                return peergos.shared.util.Futures.of(false);
+                            }
+                            return that.sandboxedApp.moveGranted(grantId, relativePath, target.grantId, folder.join('/'),
+                                    callbacks.supplier(() => that.confirmKeepAccess()))
+                                .thenApply(done => that.buildResponse(headerFunc(),
+                                    location(folder.concat([parts[parts.length - 1]]).join('/'), target.grantId), that.CREATE_SUCCESS));
+                        }).exceptionally(failed);
+                    }
                 } else if (apiMethod == 'POST') {
                     write(hasFormData ? relativePath : withRelative(that.generateUUID()), !hasFormData).exceptionally(failed);
                 } else if (apiMethod == 'PUT') {
@@ -1456,6 +1483,36 @@ module.exports = {
                     that.showConfirm = true;
                 });
             });
+        },
+        // Drive's question when something shared is moved: do people keep the access and links they have to it?
+        // Closing it without an answer leaves access as it is - the move itself the user already asked for.
+        confirmKeepAccess: function() {
+            let that = this;
+            let future = peergos.shared.util.Futures.incomplete();
+            let answered = false;
+            let answer = keep => {
+                answered = true;
+                that.showConfirm = false;
+                future.complete(keep);
+            };
+            this.confirm_message = this.translate("DRIVE.MOVE.ACCESS.TITLE");
+            this.confirm_body = this.translate("DRIVE.MOVE.ACCESS.BODY");
+            this.confirm_consumer_func = () => answer(true);
+            this.confirm_consumer_cancel_func = () => answer(false);
+            // the dialog hides before it runs the button's callback, so wait a turn to see whether one ran
+            this.confirm_on_hide = () => setTimeout(() => {
+                if (!answered)
+                    answer(true);
+            }, 0);
+            this.showConfirm = true;
+            return future;
+        },
+        confirmHidden: function() {
+            this.showConfirm = false;
+            let onHide = this.confirm_on_hide;
+            this.confirm_on_hide = null;
+            if (onHide != null)
+                onHide();
         },
         parsePositiveInt: function(num) {
             let number = parseInt(num, 10);
@@ -3659,7 +3716,7 @@ module.exports = {
                                         && expandedFilePath.startsWith(that.appPath)
                                         && that.appRegisteredWithFileAssociation
                                         );
-                                that.readFolderListing(filterResults, headerFunc("text/plain"), resp);
+                                that.readFolderListing(filterResults, headerFunc("text/plain"), resp, params.get('details') == 'true');
                             } else {
                                 let fileType = props.getType();
                                 if (params.get('preview') == 'true') {
@@ -3686,8 +3743,23 @@ module.exports = {
             let data = encoder.encode(thumbnail);
             this.buildResponse(header, data, this.GET_SUCCESS);
         },
-        readFolderListing: function(filterResults, header, folder) {
+        // details: each entry as {name, modified} and, for a file, its size in bytes, rather than a bare name - for an
+        // app that sorts by or shows when something changed. The time is UTC, as Peergos keeps it.
+        readFolderListing: function(filterResults, header, folder, details) {
             let that = this;
+            let entry = function(child, props) {
+                if (!details)
+                    return child.getName();
+                let utc = props.modified.toString() + "Z";
+                let when = new Date(utc);
+                let res = {name: child.getName(), modified: isNaN(when.getTime()) ? utc : when.toISOString()};
+                if (!props.isDirectory) {
+                    let low = props.sizeLow();
+                    if (low < 0) low = low + Math.pow(2, 32);
+                    res.size = low + props.sizeHigh() * Math.pow(2, 32);
+                }
+                return res;
+            };
             folder.getChildren(that.context.crypto.hasher, that.context.network).thenApply(function(children) {
                 let arr = children.toArray();
                 let folderListing = {files:[], subFolders:[]};
@@ -3695,14 +3767,14 @@ module.exports = {
                     let props = child.getFileProperties();
                     if (!props.isHidden) {
                         if(props.isDirectory) {
-                            folderListing.subFolders.push(child.getName());
+                            folderListing.subFolders.push(entry(child, props));
                         } else {
                             if (filterResults) {
                                 if (that.isFileAssociatedWithApp(child)) {
-                                    folderListing.files.push(child.getName());
+                                    folderListing.files.push(entry(child, props));
                                 }
                             } else {
-                                folderListing.files.push(child.getName());
+                                folderListing.files.push(entry(child, props));
                             }
                         }
                     }

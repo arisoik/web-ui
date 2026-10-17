@@ -1,13 +1,15 @@
 import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
 import java.nio.file.*;
+import java.time.*;
 import java.util.*;
 
 /** An app asks for a folder, the user approves it in the picker, and the app keeps using it.
  *
  *  The app holds no manifest permission at all: the picker is the consent. It addresses the
  *  folder only through the grant id the picker hands back, and the test checks every verb on
- *  that url against the bytes the drive then holds. The grant has to outlive the sandbox, follow
+ *  that url against the bytes the drive then holds, the listing's details, and a rename and a
+ *  move through the grant. The grant has to outlive the sandbox, follow
  *  the folder through a rename, ask once to be renewed after an unshare rotates the folder's
  *  keys, and stop working when it is revoked from the app details.
  *
@@ -109,6 +111,55 @@ public class AppFolderGrantTest {
             check(call(d, "DELETE", base + "sub/todo.md", null, null).status == 204, "delete");
             check(call(d, "GET", base + "sub/todo.md", null, null).status == 404, "deleted");
 
+            // the listing with details: when each entry changed and, for a file, how big it is. The
+            // file went up minutes ago, so a time off by whole hours is a time zone mistake.
+            Map<String, Object> detailed = (Map<String, Object>) peergos.shared.io.ipfs.api.JSONParser.parse(
+                    call(d, "GET", base + "?details=true", null, null).text);
+            Map<String, Object> entry = ((List<Map<String, Object>>) detailed.get("files")).stream()
+                    .filter(f -> "existing.txt".equals(f.get("name"))).findFirst().orElse(null);
+            check(entry != null && ((Number) entry.get("size")).longValue() == "already here".length(), "details give a file's size " + detailed);
+            Instant changed = Instant.parse((String) entry.get("modified"));
+            check(Duration.between(changed, Instant.now()).abs().toMinutes() < 30, "details give when it changed: " + changed);
+            check(((List<Map<String, Object>>) detailed.get("subFolders")).stream()
+                    .anyMatch(f -> "made".equals(f.get("name")) && f.get("modified") != null && ! f.containsKey("size")),
+                    "a folder has a time and no size " + detailed);
+
+            // rename and move take their argument as the body and answer 201 with where the entry is now; a taken
+            // name, a hidden one or a path is refused
+            Response renamed = call(d, "POST", base + "existing.txt?action=rename", "note.txt", null);
+            check(renamed.status == 201 && (base + "note.txt").equals(renamed.location), "rename " + renamed);
+            check(call(d, "GET", base + "existing.txt", null, null).status == 404, "the old name is gone");
+            check(call(d, "GET", base + "note.txt", null, null).text.equals("already here"), "read under the new name");
+            check(call(d, "POST", base + "note.txt?action=rename", "big.bin", null).status == 400, "a taken name is refused");
+            check(call(d, "POST", base + "note.txt?action=rename", ".hidden", null).status == 400, "a hidden name is refused");
+            check(call(d, "POST", base + "note.txt?action=rename", "a/b", null).status == 400, "a path is refused");
+            Response moved = call(d, "POST", base + "note.txt?action=move", id + "/made", null);
+            check(moved.status == 201 && (base + "made/note.txt").equals(moved.location), "move " + moved);
+            check(call(d, "GET", base + "note.txt", null, null).status == 404, "moved away");
+            check(call(d, "GET", base + "made/note.txt", null, null).text.equals("already here"), "read where it went");
+            check(Fixtures.listing(jar, url, user, password, NOTES + "/made").contains("note.txt"), "the move is in the drive");
+
+            // a shared entry asks the user, as Drive does, whether people keep access; closing the question keeps it
+            check(call(d, "POST", base + "made/kept?type=directory", "", null).status == 201, "mkdir for the shared moves");
+            d.script("const ctx = window.__launcher.context; window.__linked = false;"
+                    + "ctx.createSecretLink(arguments[0], false, java.util.Optional.empty(), '', '', false)"
+                    + "  .thenApply(l => window.__linked = true);", "/" + user + "/" + NOTES + "/made/note.txt");
+            d.waitForScript("the secret link", "window.__linked === true", 120_000);
+            start(d, "sharedMove", "POST", base + "made/note.txt?action=move", id + "/made/kept", null);
+            d.waitForScript("the keep-access question", "!!document.getElementById('confirm-header-id')", 60_000);
+            String question = String.valueOf(d.script("return document.getElementById('confirm-header-id').textContent"));
+            check(question.contains("access"), "the move asks about access: " + question);
+            d.script("document.getElementById('confirm-header-id').closest('.pg-dialog').querySelector('.pg-dialog__close').click();");
+            Response dismissed = await(d, "sharedMove");
+            check(dismissed.status == 201 && (base + "made/kept/note.txt").equals(dismissed.location), "closing the question moves it, access kept " + dismissed);
+            start(d, "sharedMoveBack", "POST", base + "made/kept/note.txt?action=move", id + "/made", null);
+            d.waitForScript("the keep-access question again", "!!document.getElementById('confirm-header-id')", 60_000);
+            d.script("[...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'No').click();");
+            Response notKept = await(d, "sharedMoveBack");
+            check(notKept.status == 201 && (base + "made/note.txt").equals(notKept.location), "answering no moves it too " + notKept);
+            check(call(d, "GET", base + "made/note.txt", null, null).text.equals("already here"), "read the shared file where it went");
+
+
             check(call(d, "GET", base + "%2E%2E/" + PHOTOS, null, null).status == 400, "no way out through ..");
             check(call(d, "GET", "/peergos-api/v0/folder/bnotagrant/existing.txt", null, null).status == 400, "unknown grant");
             check(call(d, "GET", "/" + user + "/" + NOTES + "/existing.txt", null, null).status != 200, "no absolute path access");
@@ -133,6 +184,8 @@ public class AppFolderGrantTest {
             String readId = (String) read.get("grantId");
             check(Boolean.FALSE.equals(read.get("write")), "read grant " + read);
             check(call(d, "PUT", "/peergos-api/v0/folder/" + readId + "/x.md", "x", null).status == 403, "read grant refuses writes");
+            check(call(d, "POST", base + "made/note.txt?action=move", readId + "/", null).status == 403, "no moving into a read grant");
+            check(call(d, "GET", base + "made/note.txt", null, null).text.equals("already here"), "the refused move left it be");
 
             // the plain picker is unchanged: no switches, and absolute paths back
             start(d, "legacy", "GET", "/peergos-api/v0/folders/?multiple=false", null, null);
