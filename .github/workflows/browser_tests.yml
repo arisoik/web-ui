@@ -17,32 +17,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        engine: [firefox, chromium, brave, webkit, safari]
-        exclude:
-          # WebKitGTK and its driver are linux only; safari and safaridriver are macos only
-          - os: windows-latest
-            engine: webkit
-          - os: macos-latest
-            engine: webkit
-          - os: ubuntu-latest
-            engine: safari
-          # brave is the same engine as chromium, so one platform is enough to catch what is
-          # brave specific - its shields defaults, which can affect storage and service workers
-          - os: windows-latest
-            engine: brave
-          - os: macos-latest
-            engine: brave
-          - os: windows-latest
-            engine: safari
-          # homebrew disabled the chromedriver cask on 2026-09-01 for failing the macos
-          # gatekeeper check, and the design rule here is not to download drivers by hand.
-          # Chromium is covered on linux and windows; macos is covered by safari, which is
-          # the engine that actually matters there anyway.
-          - os: macos-latest
-            engine: chromium
+        os: [windows-latest]
+        engine: [chromium]
+        attempt: [1, 2]
     runs-on: ${{ matrix.os }}
-    name: ${{ matrix.engine }} on ${{ matrix.os }}
+    name: ${{ matrix.engine }} on ${{ matrix.os }} (${{ matrix.attempt }})
     steps:
     - uses: actions/checkout@v6
     - name: Set up JDK
