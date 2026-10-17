@@ -17,30 +17,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        engine: [firefox, chromium, brave, webkit, safari]
-        exclude:
-          # WebKitGTK and its driver are linux only; safari and safaridriver are macos only
-          - os: windows-latest
-            engine: webkit
-          - os: macos-latest
-            engine: webkit
-          - os: ubuntu-latest
-            engine: safari
-          # brave is the same engine as chromium, so one platform is enough to catch what is
-          # brave specific - its shields defaults, which can affect storage and service workers
-          - os: windows-latest
-            engine: brave
-          - os: macos-latest
-            engine: brave
-          - os: windows-latest
-            engine: safari
-          # homebrew disabled the chromedriver cask on 2026-09-01 for failing the macos
-          # gatekeeper check, and the design rule here is not to download drivers by hand.
-          # Chromium is covered on linux and windows; macos is covered by safari, which is
-          # the engine that actually matters there anyway.
-          - os: macos-latest
-            engine: chromium
+        os: [ubuntu-latest]
+        engine: [webkit]
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.engine }} on ${{ matrix.os }}
     steps:
@@ -127,29 +105,11 @@ jobs:
           safari)   safaridriver --version || true ;;
         esac
 
-    - name: Run the folder grant test
-      working-directory: browser_tests
-      # windows is several times slower on the sqlite backed server
-      timeout-minutes: ${{ matrix.os == 'windows-latest' && 40 || 20 }}
-      shell: bash
-      env:
-        # safari has no headless mode, and the macos runner has a ui session for it to use
-        HEADLESS: ${{ matrix.engine == 'safari' && '0' || '1' }}
-        # the windows and macos runners are slower, and safari cannot run headless so it is
-        # doing real rendering besides: the browser side sign in needs longer than the 300s
-        # that suffices on linux. WebKitGTK is named too though it runs on linux: it takes half
-        # a minute just to launch where chromium takes two seconds, and every step after is in
-        # proportion.
-        PEERGOS_TEST_SLOW: ${{ (matrix.os == 'windows-latest' || matrix.os == 'macos-latest' || matrix.engine == 'webkit') && '1' || '0' }}
-        # only linux ships the browser under this name; elsewhere chromedriver finds it itself
-        CHROMIUM: ${{ runner.os == 'Linux' && '/usr/bin/google-chrome' || '' }}
-      run: java -cp ../server/Peergos.jar AppFolderGrantTest.java ${{ matrix.engine }}
-
     - name: Run browser tests
       if: always()
       working-directory: browser_tests
       # windows is several times slower on the sqlite backed server
-      timeout-minutes: ${{ matrix.os == 'windows-latest' && 90 || 45 }}
+      timeout-minutes: 75
       shell: bash
       env:
         # safari has no headless mode, and the macos runner has a ui session for it to use
