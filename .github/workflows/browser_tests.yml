@@ -4,7 +4,7 @@ on:
   # Pushes only on master: a branch with a pull request open would otherwise run the whole
   # matrix twice for every commit, once for the push and once for the pull request.
   push:
-    branches: [master]
+    branches: [master, 'ci/**']
   pull_request:
 
 # A new commit makes the run in progress for that branch pointless, and these jobs are long
@@ -60,6 +60,14 @@ jobs:
           macOS)   brew install ant ;;
           Linux)   sudo apt-get update && sudo apt-get install -y ant ;;
         esac
+
+    - name: Peergos at the change under test
+      shell: bash
+      run: |
+        git submodule update --init peergos
+        git -C peergos fetch https://github.com/arisoik/Peergos feat/grant-rename-move
+        git -C peergos checkout --detach FETCH_HEAD
+        git -C peergos log --oneline -1
 
     - name: Build server and web ui
       run: ant -noinput -buildfile build.xml peergos_submodule_sync dist
@@ -119,7 +127,26 @@ jobs:
           safari)   safaridriver --version || true ;;
         esac
 
+    - name: Run the folder grant test
+      working-directory: browser_tests
+      # windows is several times slower on the sqlite backed server
+      timeout-minutes: ${{ matrix.os == 'windows-latest' && 40 || 20 }}
+      shell: bash
+      env:
+        # safari has no headless mode, and the macos runner has a ui session for it to use
+        HEADLESS: ${{ matrix.engine == 'safari' && '0' || '1' }}
+        # the windows and macos runners are slower, and safari cannot run headless so it is
+        # doing real rendering besides: the browser side sign in needs longer than the 300s
+        # that suffices on linux. WebKitGTK is named too though it runs on linux: it takes half
+        # a minute just to launch where chromium takes two seconds, and every step after is in
+        # proportion.
+        PEERGOS_TEST_SLOW: ${{ (matrix.os == 'windows-latest' || matrix.os == 'macos-latest' || matrix.engine == 'webkit') && '1' || '0' }}
+        # only linux ships the browser under this name; elsewhere chromedriver finds it itself
+        CHROMIUM: ${{ runner.os == 'Linux' && '/usr/bin/google-chrome' || '' }}
+      run: java -cp ../server/Peergos.jar AppFolderGrantTest.java ${{ matrix.engine }}
+
     - name: Run browser tests
+      if: always()
       working-directory: browser_tests
       # windows is several times slower on the sqlite backed server
       timeout-minutes: ${{ matrix.os == 'windows-latest' && 90 || 45 }}
