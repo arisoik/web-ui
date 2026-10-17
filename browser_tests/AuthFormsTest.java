@@ -58,6 +58,16 @@ public class AuthFormsTest {
                         checkboxes(d, name + ", " + TABS[tab]);
                         if (shortcuts)
                             clipboard(d, name + ", " + TABS[tab]);
+                        else if (tab == 0 && theme.equals("light")) {
+                            d.script("window.__keys = []; document.addEventListener('keydown', e => window.__keys.push(e.key + (e.metaKey ? '+meta' : '')), true); return 1;");
+                            Object f = d.find("[role=tabpanel] input[name=username]");
+                            d.click(f);
+                            d.sendKeys(f, "probe");
+                            d.sendKeys(f, MOD + "a" + RELEASE);
+                            System.out.println("DIAG safari after Command-A: " + d.script("const i = document.querySelector('[role=tabpanel] input[name=username]');"
+                                    + " return JSON.stringify({value: i.value, selection: [i.selectionStart, i.selectionEnd], keys: window.__keys})"));
+                            d.script("const i = document.querySelector('[role=tabpanel] input[name=username]'); i.value = ''; i.dispatchEvent(new Event('input', {bubbles: true})); return 1;");
+                        }
                         if (theme.equals("light")) {
                             hints(d, TABS[tab], tab == 2 ? "new-password" : "current-password");
                             caret(d, TABS[tab]);
