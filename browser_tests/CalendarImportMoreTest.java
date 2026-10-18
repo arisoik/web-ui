@@ -206,9 +206,10 @@ public class CalendarImportMoreTest {
                         + " && document.getElementById('import-file').textContent === " + CalendarApp.quote(file), 120_000);
     }
 
-    /** An element's text in the app, with the narrow spaces some engines put around a date range made plain. */
+    /** An element's text in the app, with the narrow spaces some engines put around a date range, and the ones that
+     *  keep a count with its word, made plain. */
     static String text(WebDriver d, String id) {
-        return String.valueOf(CalendarApp.inFrame(d, "return document.getElementById(arguments[0]).textContent.replace(/[\\u2009\\u202f]/g, ' ');", id));
+        return String.valueOf(CalendarApp.inFrame(d, "return document.getElementById(arguments[0]).textContent.replace(/[\\u00a0\\u2009\\u202f]/g, ' ');", id));
     }
 
     /** Waits for the already-here line to settle on `expected`, or to be hidden when that is null. */

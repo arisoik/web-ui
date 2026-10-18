@@ -3114,7 +3114,7 @@ function leftOutOf(parsed, choice) {
 }
 
 // When each kind in a file falls, for the question: the span of its dates, how many events
-// repeat, and how many tasks have no date at all.
+// repeat, and how many tasks have no date at all - a count kept on one line with its word.
 let IMPORT_DATE_FORMAT = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 
 function importDateSpan(dates) {
@@ -3135,13 +3135,13 @@ function importDatesOf(parsed) {
     let starts = parsed.events.map(parsedEventStart).filter(function (d) { return !isNaN(d); });
     let repeating = parsed.events.filter(function (e) { return e.extendedProps && e.extendedProps.recur; }).length;
     let events = [importDateSpan(starts)];
-    if (repeating > 0) events.push(repeating + ' repeating');
+    if (repeating > 0) events.push(repeating + '\u00a0repeating');
     let dues = parsed.tasks.map(function (t) { return t.due; })
         .filter(function (d) { return d instanceof Date && !isNaN(d); });
     let undated = parsed.tasks.length - dues.length;
     let tasks = [];
-    if (dues.length > 0) tasks.push('due ' + importDateSpan(dues));
-    if (undated > 0) tasks.push(undated === parsed.tasks.length ? (undated === 1 ? 'no due date' : 'no due dates') : undated + ' undated');
+    if (dues.length > 0) tasks.push('due\u00a0' + importDateSpan(dues));
+    if (undated > 0) tasks.push(undated === parsed.tasks.length ? (undated === 1 ? 'no due date' : 'no due dates') : undated + '\u00a0undated');
     return { events: events.filter(Boolean).join(' · '), tasks: tasks.join(' · ') };
 }
 
