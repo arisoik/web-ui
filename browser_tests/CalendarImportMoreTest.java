@@ -1,10 +1,13 @@
 import java.nio.file.*;
+import java.time.LocalDate;
 import java.util.*;
 
 /** What the import question says besides the counts, and what it can do besides choosing a calendar there is:
  *  when the file's entries fall, how many of them are already here - months the grid has not loaded included -
  *  importing into a new calendar named after the file, and a big import cancelled from Peergos' own progress bar,
- *  with the next file's question held back until that save is over. Each checked by what lands in the store.
+ *  with the next file's question held back until that save is over and the host has reset the app to what is
+ *  stored - a next file imported before that reset would be cleared from the grid by it. Each checked by what
+ *  lands in the store.
  *
  *  An account of its own: it makes calendars and fills them.
  *
@@ -143,7 +146,11 @@ public class CalendarImportMoreTest {
             for (int i = 0; i < 300; i++)
                 many.append(ev("bulk-" + i, String.format("2028%02d%02d", 1 + i % 12, 1 + i % 28), "Bulk " + i));
             String big = CalendarImportDialogTest.calendar(many.toString());
-            CalendarImportDialogTest.hand(d, List.of(List.of("big.ics", big), List.of("small.ics", CalendarImportDialogTest.MORE)));
+            // mid-month, so on the month the grid opened on whatever the time zone
+            LocalDate today = LocalDate.now();
+            String next = CalendarImportDialogTest.calendar(ev("after-cancel",
+                    String.format("%04d%02d15", today.getYear(), today.getMonthValue()), "Right after the cancel"));
+            CalendarImportDialogTest.hand(d, List.of(List.of("big.ics", big), List.of("next.ics", next)));
             awaitQuestion(d, "big.ics (1 of 2)");
             // Pressed the moment Peergos' progress bar offers it - a few hundred small files are
             // written in about a second here - and the time the next question opened kept beside it.
@@ -154,10 +161,14 @@ public class CalendarImportMoreTest {
                     + "  if (!cancel) return;"
                     + "  watcher.disconnect(); window.__cancelledAt = Date.now(); cancel.click();"
                     + "}).observe(document.body, {childList: true, subtree: true}); return 1;");
-            CalendarApp.inFrame(d, "window.__nextAskedAt = null;"
+            // The next question answered the moment it opens, faster than anyone could, and every
+            // `load` the host sends the app - the reset it reads the store again after - noted.
+            CalendarApp.inFrame(d, "window.__nextAskedAt = null; window.__loads = [];"
+                    + "window.addEventListener('message', function (e) { if (e.data && e.data.type === 'load') window.__loads.push(Date.now()); });"
                     + "new MutationObserver(function () {"
                     + "  if (window.__nextAskedAt == null && document.getElementById('import-file').textContent.indexOf('2 of 2') !== -1"
-                    + "      && document.getElementById('import-modal-backdrop').classList.contains('open')) window.__nextAskedAt = Date.now();"
+                    + "      && document.getElementById('import-modal-backdrop').classList.contains('open')) {"
+                    + "    window.__nextAskedAt = Date.now(); document.getElementById('import-confirm').click(); }"
                     + "}).observe(document.body, {childList: true, subtree: true, attributes: true, characterData: true});"
                     + CalendarApp.click("import-confirm") + "return 1;");
             try {
@@ -170,19 +181,25 @@ public class CalendarImportMoreTest {
                         + " + ', summary ' + document.getElementById('import-summary-modal-backdrop').classList.contains('open');"));
                 throw e;
             }
-            awaitQuestion(d, "small.ics (2 of 2)");
+            CalendarImportDialogTest.expectSummary(d, "big.ics: Cancelled while saving", "next.ics: Imported 1 event.");
             long cancelledAt = ((Number) d.script("return window.__cancelledAt;")).longValue();
             long nextAskedAt = ((Number) CalendarApp.inFrame(d, "return window.__nextAskedAt;")).longValue();
             if (nextAskedAt < cancelledAt)
                 throw new AssertionError("The next file was asked about " + (cancelledAt - nextAskedAt) + "ms before the first one's save was over");
-            CalendarApp.inFrame(d, CalendarApp.click("import-cancel") + "return 1;");
+            Object resetAt = CalendarApp.inFrame(d, "return window.__loads.length > 0 ? window.__loads[0] : null;");
+            if (resetAt == null || ((Number) resetAt).longValue() > nextAskedAt)
+                throw new AssertionError("The next file was asked about before the host reset the app to what is stored: reset at "
+                        + resetAt + ", asked at " + nextAskedAt);
             int stored = 0;
             for (int m = 1; m <= 12; m++)
                 stored += CalendarImportDialogTest.listOrEmpty(d, main + "/2028/" + m).size();
-            CalendarImportDialogTest.expectSummary(d, "big.ics: Cancelled while saving", "small.ics: Not imported.");
             if (stored >= 300)
                 throw new AssertionError("Cancelling should stop the save part way, but all " + stored + " were stored");
-            System.out.println("  ok   cancelled with " + stored + " of 300 stored; the next question waited for the save to end");
+            CalendarImportDialogTest.awaitStored(d, main + "/" + today.getYear() + "/" + today.getMonthValue(), "after-cancel.ics");
+            CalendarApp.waitInFrame(d, "the next file's entry on the grid, after the reset",
+                    "Array.from(document.querySelectorAll('[data-search-event-id]')).some(el => el.textContent.indexOf('Right after the cancel') !== -1)", 30_000);
+            System.out.println("  ok   cancelled with " + stored + " of 300 stored; the next question waited for the save to end and the"
+                    + " reset after it, and the file imported straight after is stored and on the grid");
             System.out.println("PASS");
         } finally {
             if (own != null)

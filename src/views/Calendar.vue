@@ -1064,22 +1064,23 @@ module.exports = {
             return null;
         });
     },
-    load: function(calendar, year, month) {
+    // `onReset`, when given, runs once the app has been sent the `load` that resets it.
+    load: function(calendar, year, month, onReset) {
         let that = this;
         that.updateCalendarList(calendar).thenApply(function(modified) {
             if (modified) {
                 that.updatePropertiesFile(calendar, that.calendarProperties).thenApply(res => {
-                    that.loadCalendars(calendar, year, month);
+                    that.loadCalendars(calendar, year, month, undefined, onReset);
                     return null;
                 }).exceptionally(t => {
                     // The list in memory is already right, and the write that failed is of the
                     // record of it. Loading anyway is what keeps a conflict on that one file
                     // from costing the whole view.
-                    that.loadCalendars(calendar, year, month);
+                    that.loadCalendars(calendar, year, month, undefined, onReset);
                     return null;
                 });
             } else {
-                that.loadCalendars(calendar, year, month);
+                that.loadCalendars(calendar, year, month, undefined, onReset);
             }
         });
     },
@@ -1088,7 +1089,7 @@ module.exports = {
     // each read lands. The buckets are read at the same time rather than one
     // after another: they are independent directories, and a phone waiting
     // for the slowest of them was waiting for all of them.
-    loadCalendars: function(calendar, year, month, importCalendarEventParams) {
+    loadCalendars: function(calendar, year, month, importCalendarEventParams, onReset) {
         let that = this;
         let token = ++this.loadToken;
         this.lastLoad = {year: year, month: month};
@@ -1099,6 +1100,9 @@ module.exports = {
             // One message per month, plus the recurring folder, the tasks, and the entries
             // other people have shared with us.
             that.postLoadShell(year, month, months.length + 3, importCalendarEventParams);
+            if (onReset) {
+                onReset();
+            }
             months.forEach(function(each) {
                 that.getCalendarEventsForMonth(calendar, each.year, each.month).thenApply(function(events) {
                     if (token === that.loadToken)
@@ -2005,29 +2009,31 @@ module.exports = {
             // The bar dismisses itself on the last file; an upload that
             // failed never reaches it and would otherwise stay on screen.
             that.$toast.dismiss(name);
-            answer(transfers.isCancelled(uploads.transfer) ? 'cancelled' : 'failed', kept);
-            that.readStoreAfterImport(calendar);
+            let outcome = transfers.isCancelled(uploads.transfer) ? 'cancelled' : 'failed';
+            that.readStoreAfterImport(calendar, function() { answer(outcome, kept); });
         }).exceptionally(function(throwable) {
             that.$toast.dismiss(name);
             that.removeSpinner();
             that.showMessage(true, that.translate('CALENDAR.ERROR.IMPORT.EVENT'));
-            answer('failed', kept);
-            that.readStoreAfterImport(calendar);
+            that.readStoreAfterImport(calendar, function() { answer('failed', kept); });
             return null;
         });
     },
     // The app shows every entry of an import as soon as it sends them, so a save that did not
     // finish - cancelled or failed - leaves it showing some that were never stored: the store is
-    // read again, as a refresh reads it.
-    readStoreAfterImport: function(calendar) {
+    // read again, as a refresh reads it. `then` runs once the app has been reset for that read,
+    // or once it cannot be: the answer to the import waits for it, since the reset clears the
+    // grid, and would clear the entries of a next file imported before it arrived.
+    readStoreAfterImport: function(calendar, then) {
         let that = this;
         let now = new Date();
         this.displaySpinner();
         this.getPropertiesFile(calendar).thenApply(function(props) {
             that.calendarProperties = props;
-            that.load(calendar, now.getFullYear(), now.getMonth() + 1);
+            that.load(calendar, now.getFullYear(), now.getMonth() + 1, then);
         }).exceptionally(function(t) {
             that.removeSpinner();
+            then();
             return null;
         });
     },

@@ -285,11 +285,12 @@ stays disabled while nothing is ticked or a new calendar's name will not do.
 Leaving the question any other way - Cancel or Skip, Escape, the close button, a
 tap beside it, Android's back - leaves that file out. The file is parsed once,
 for the question, and the entries imported are those same parsed ones. The
-next question waits for the host's `savedAll`, so two saves never run at once;
-a save cancelled from its progress bar keeps what was written before then, and
-the host reads the store again after one that did not finish. One summary at
-the end says what happened to each file, and none appears when every file was
-left out.
+next question waits for the host's `savedAll`, so two saves never run at once.
+A save cancelled from its progress bar keeps what was written before then; after
+one that did not finish the host reads the store again, and answers once the
+app has been reset for that read, which would otherwise clear the next file's
+entries from the grid. One summary at the end says what happened to each file,
+and none appears when every file was left out.
 
 The app tracks where each event's file currently lives. Changing an event's
 date, calendar, or recurring-ness *moves* its file, so the app sends the move
