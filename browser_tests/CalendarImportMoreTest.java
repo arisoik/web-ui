@@ -52,14 +52,6 @@ public class CalendarImportMoreTest {
             CalendarApp.monthView(d);
             String main = CalendarApp.directoryOf(d, user);
             String target = CalendarWholeShareTest.addCalendar(d, CalendarImportDialogTest.TARGET, "Already in the target");
-            // every toast that appears, kept for the report of a failure at the Cancel step below
-            d.script("window.__toastLog = [];"
-                    + "new MutationObserver(function () {"
-                    + "  document.querySelectorAll('.Vue-Toastification__toast').forEach(function (t) {"
-                    + "    let s = t.textContent.replace(/\\s+/g, ' ').trim().slice(0, 50).replace(/[0-9]+%/, '') + (t.querySelector('.progress__cancel') ? ' [Cancel]' : '');"
-                    + "    if (window.__toastLog[window.__toastLog.length - 1] !== s) window.__toastLog.push(s);"
-                    + "  });"
-                    + "}).observe(document.body, {childList: true, subtree: true, characterData: true}); return 1;");
 
             // --- when the entries fall --------------------------------------------------------------
             String dated = CalendarImportDialogTest.calendar(ev("span-a", "20270301", "Span start"), ev("span-b", "20270621", "Span end"),
@@ -174,7 +166,8 @@ public class CalendarImportMoreTest {
             try {
                 d.waitForScript("Cancel on the import's progress bar, pressed", "window.__cancelledAt != null", 60_000);
             } catch (IllegalStateException e) {
-                System.out.println("  toast log: " + d.scriptQuiet("return window.__toastLog.join(' | ')"));
+                System.out.println("  toasts: " + d.scriptQuiet("return Array.from(document.querySelectorAll('.Vue-Toastification__toast'))"
+                        + ".map(t => t.textContent.replace(/\\s+/g, ' ').trim().slice(0, 50) + (t.querySelector('.progress__cancel') ? ' [Cancel]' : '')).join(' | ');"));
                 System.out.println("  frame: " + CalendarApp.inFrame(d, "return 'question ' + document.getElementById('import-modal-backdrop').classList.contains('open') + ' ' + document.getElementById('import-file').textContent"
                         + " + ', import ' + (document.getElementById('import-confirm').disabled ? 'disabled' : 'enabled') + ' [' + document.getElementById('import-confirm').textContent + ']'"
                         + " + ', new error ' + document.getElementById('import-new-error').textContent + ', calendar ' + document.getElementById('import-calendar').value"

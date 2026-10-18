@@ -809,12 +809,11 @@ module.exports = {
         queued.forEach(function(job) { that.answerSweep(job, 'cancelled'); });
     },
 
-    // Directory names are data from the store, so they are matched against
-    // the same bounds eventDirPath() writes with rather than trusted.
     // Every entry id stored in one calendar - its months, `recurring` and `tasks` - for the
     // import question to say how many of a file's entries are already here, months the grid
-    // has not loaded included. Names only: nothing is read. Answered once, as `calendarIds`,
-    // with `complete` false when a calendar is unknown or a directory could not be listed.
+    // has not loaded included. Names only: nothing is read. Answered once, as `calendarIds`; a
+    // directory that cannot be listed counts as empty, as an unknown calendar does - the save
+    // still leaves alone whatever turns out to be stored already.
     listCalendarIds: function(calendar, data) {
         let that = this;
         let requestId = data.requestId;
@@ -822,25 +821,20 @@ module.exports = {
             return;
         }
         let cal = this.findCalendar(data.calendarName);
-        let reply = function(ids, complete) {
-            that.postMessage({type: 'calendarIds', requestId: requestId, ids: ids, complete: complete});
+        let reply = function(ids) {
+            that.postMessage({type: 'calendarIds', requestId: requestId, ids: ids});
         };
         if (cal == null) {
-            reply([], false);
+            reply([]);
             return;
         }
         let ids = [];
-        let complete = true;
-        // A directory nothing was ever written to is not there yet, which is an empty one.
         let list = function(parts) {
             let future = peergos.shared.util.Futures.incomplete();
             let path = peergos.client.PathUtils.directoryToPath(cal.directory.split('/').concat(parts));
             calendar.dirInternal(path, cal.owner).thenApply(function(names) {
                 future.complete(names.toArray([]).map(function(n) { return String(n); }));
             }).exceptionally(function(t) {
-                if (String(t).indexOf('NoSuchElementException') === -1) {
-                    complete = false;
-                }
                 future.complete([]);
                 return null;
             });
@@ -856,7 +850,7 @@ module.exports = {
         let dirs = [];
         let walk = function(index) {
             if (index >= dirs.length) {
-                reply(ids, complete);
+                reply(ids);
                 return;
             }
             list(dirs[index]).thenApply(function(names) {
@@ -886,6 +880,9 @@ module.exports = {
             return null;
         });
     },
+
+    // Directory names are data from the store, so they are matched against
+    // the same bounds eventDirPath() writes with rather than trusted.
     isSweepYear: function(name) {
         let n = parseInt(name, 10);
         return /^[0-9]{1,4}$/.test(name) && n >= 1 && n <= 9999;

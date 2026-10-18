@@ -278,10 +278,11 @@ a kind it has none of is shown, greyed - and offers the calendars that can be
 written to, starting on the default one and then on wherever the previous file
 went, and a new one, named after the file and held to the host's rules for a
 name - asked for with a `requestId`, so that the host answers a refusal or a
-failure too, as `failed`, and the import is not left waiting. It says how many of the ticked entries are already here and will be
-skipped: those the page holds, and those the host finds stored in the chosen
-calendar (`listCalendarIds`), months the grid has not loaded included. Import
-stays disabled while nothing is ticked or a new calendar's name will not do.
+failure too, as `failed`, and the import is not left waiting. It says how many
+of the ticked entries are already here and will be skipped: those the page
+holds, and those the host finds stored in the chosen calendar
+(`listCalendarIds`), months the grid has not loaded included. Import stays
+disabled while nothing is ticked or a new calendar's name will not do.
 Leaving the question any other way - Cancel or Skip, Escape, the close button, a
 tap beside it, Android's back - leaves that file out. The file is parsed once,
 for the question, and the entries imported are those same parsed ones. The
